@@ -1,0 +1,24 @@
+[package]
+name = "tinylayer-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Reference client for the Tinylayer enclave API"
+
+[dependencies]
+bitcoin.workspace = true
+enclavia.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tinylayer-enclave = { path = "../enclave" }
+
+[dev-dependencies]
+bytes = "=1.12.1"
+enclavia-protocol = { version = "=0.2.0", features = ["test-utils"] }
+futures-util = "=0.3.34"
+tokio.workspace = true
+tokio-tungstenite = "=0.26.2"

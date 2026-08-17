@@ -1,0 +1,40 @@
+[package]
+name = "tinylayer-enclave"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Trusted core and Enclavia workload for the Tinylayer proof of concept"
+
+[features]
+default = []
+workload = ["dep:axum", "dep:tokio"]
+
+[dependencies]
+axum = { workspace = true, optional = true }
+secp256k1.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+http-body-util.workspace = true
+serde_json.workspace = true
+tower.workspace = true
+
+[[bin]]
+name = "tinylayer-workload"
+path = "src/lib.rs"
+required-features = ["workload"]
+
+[[test]]
+name = "workload"
+path = "tests/workload.rs"
+required-features = ["workload"]
+
+[[test]]
+name = "binary"
+path = "tests/binary.rs"
+required-features = ["workload"]

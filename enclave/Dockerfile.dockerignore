@@ -1,0 +1,6 @@
+target
+.git
+client/examples
+client/scripts
+client/tests
+enclave/tests

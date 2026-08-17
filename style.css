@@ -1,0 +1,109 @@
+.highlighter-rouge,
+pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.language-rust.highlighter-rouge {
+  overflow: hidden;
+  border: 1px solid #30363d;
+  background: #0d1117;
+  color: #e6edf3;
+}
+
+.language-rust .highlight {
+  margin: 0;
+  background: transparent;
+}
+
+.language-rust pre {
+  margin: 0;
+  padding: 1rem;
+  overflow-x: auto;
+  color: #e6edf3;
+  background: transparent;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  tab-size: 4;
+}
+
+.language-rust code {
+  font: inherit;
+}
+
+.language-rust .highlight .c,
+.language-rust .highlight .c1,
+.language-rust .highlight .cm,
+.language-rust .highlight .cp,
+.language-rust .highlight .cs {
+  color: #8b949e;
+  font-style: italic;
+}
+
+.language-rust .highlight .k,
+.language-rust .highlight .kc,
+.language-rust .highlight .kd,
+.language-rust .highlight .kn,
+.language-rust .highlight .kp,
+.language-rust .highlight .kr,
+.language-rust .highlight .kt {
+  color: #ff7b72;
+}
+
+.language-rust .highlight .s,
+.language-rust .highlight .s1,
+.language-rust .highlight .s2,
+.language-rust .highlight .sb,
+.language-rust .highlight .sc,
+.language-rust .highlight .sd,
+.language-rust .highlight .se,
+.language-rust .highlight .sh,
+.language-rust .highlight .si,
+.language-rust .highlight .sr,
+.language-rust .highlight .ss,
+.language-rust .highlight .sx {
+  color: #a5d6ff;
+}
+
+.language-rust .highlight .m,
+.language-rust .highlight .mb,
+.language-rust .highlight .mf,
+.language-rust .highlight .mh,
+.language-rust .highlight .mi,
+.language-rust .highlight .mo,
+.language-rust .highlight .il {
+  color: #79c0ff;
+}
+
+.language-rust .highlight .na,
+.language-rust .highlight .nb,
+.language-rust .highlight .bp,
+.language-rust .highlight .nc,
+.language-rust .highlight .nd,
+.language-rust .highlight .ne,
+.language-rust .highlight .nf,
+.language-rust .highlight .nl,
+.language-rust .highlight .nn,
+.language-rust .highlight .nt,
+.language-rust .highlight .nx,
+.language-rust .highlight .py {
+  color: #d2a8ff;
+}
+
+.language-rust .highlight .o,
+.language-rust .highlight .ow,
+.language-rust .highlight .p {
+  color: #c9d1d9;
+}
+
+.language-rust .highlight .err {
+  color: #ffa198;
+  background: transparent;
+}

@@ -1,0 +1,36 @@
+[package]
+name = "tinylayer-wallet"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Native wallet and test harness for Tinylayer"
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+bitcoin.workspace = true
+bitcoincore-rpc.workspace = true
+chacha20poly1305.workspace = true
+clap.workspace = true
+enclavia.workspace = true
+fs2.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tinylayer-client = { path = "../client" }
+tinylayer-enclave = { path = "../enclave" }
+tokio.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+bitcoin.workspace = true
+tempfile = "=3.23.0"
+tinylayer-enclave = { path = "../enclave", features = ["workload"] }
