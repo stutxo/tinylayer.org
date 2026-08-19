@@ -71,7 +71,7 @@ output is a one-leaf P2TR output with this script:
 <client_xonly> OP_CHECKSIGVERIFY <enclave_xonly> OP_CHECKSIG
 ```
 
-The enclave does not parse a transaction, inspect an amount, check a locktime,
+The enclave does not parse a transaction, inspect an amount, check a relative delay,
 or decide where funds go. It signs an opaque 32-byte digest after checking the
 current bearer authorization. The untrusted reference client constructs and
 validates the Bitcoin transaction before and after the enclave call.
@@ -148,11 +148,11 @@ Operational consequences:
   applying a secret change requires a destructive restart.
 - Do not stop or replace the process while any funded coin depends on it for a
   future transition.
-- A coin has no signed recovery from the moment its funding transaction is
-  broadcast until `coin activate` completes. `coin fund` waits for the
-  configured confirmations before activation can begin. The signer must remain
-  alive throughout this unavoidable interval or the funding output can be
-  stranded permanently.
+- `coin fund` finalizes and journals the funding transaction without
+  broadcasting it, obtains and durably stores Alice's recovery, and only then
+  broadcasts the exact funding bytes. Signer loss before recovery completion
+  leaves the source funds in the configured Core wallet; signer loss after
+  recovery completion leaves Alice with a unilateral recovery.
 - After signer loss, owners can only use recoveries already stored by their
   wallets once those transactions become final. The enclave state cannot be
   reconstructed.
@@ -496,7 +496,7 @@ configured attested connection before registering a coin:
 `enclave verify` reads `config.json` without decrypting wallet state and checks
 attestation plus the health endpoint. It is a preflight rather than wallet-state
 authentication; `coin register` opens the authenticated wallet and repeats the
-attested connection. Do not fund an address until registration returns a result
+attested connection. Do not prepare funding until registration returns a result
 that the wallet has verified against the pinned identity. Continue with the
 [wallet guide](../wallet/).
 
@@ -519,6 +519,7 @@ the explicit debug flag. This example uses a local Bitcoin Core node:
   --pcr2 "$(jq -er '.pcrs.PCR2' <<<"$DEBUG_JSON")" \
   --bitcoin-rpc-url http://127.0.0.1:18443 \
   --bitcoin-cookie-file /secure/path/to/regtest/.cookie \
+  --bitcoin-wallet funder \
   --min-confirmations 1
 ```
 

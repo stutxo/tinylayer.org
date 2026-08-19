@@ -14,9 +14,13 @@ use axum::{
     routing::{get, post},
 };
 use bitcoin::{
-    Address, KnownHrp, Transaction,
-    consensus::deserialize,
+    Address, Amount, KnownHrp, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+    Witness, absolute,
+    address::NetworkUnchecked,
+    consensus::{deserialize, encode::serialize_hex},
+    hashes::Hash as _,
     secp256k1::{Secp256k1, SecretKey},
+    transaction::Version,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -28,6 +32,11 @@ const AMOUNT_SAT: u64 = 100_000;
 #[derive(Clone)]
 struct CoreState {
     funding: Arc<Mutex<Option<Funding>>>,
+    prepared: Arc<Mutex<Option<Transaction>>>,
+    broadcasts: Arc<Mutex<Vec<String>>>,
+    locked_inputs: Arc<Mutex<Vec<OutPoint>>>,
+    lock_calls: Arc<Mutex<u32>>,
+    in_mempool: Arc<Mutex<bool>>,
     tip: Arc<Mutex<u64>>,
     confirmations: Arc<Mutex<u32>>,
 }
@@ -36,6 +45,11 @@ impl Default for CoreState {
     fn default() -> Self {
         Self {
             funding: Arc::new(Mutex::new(None)),
+            prepared: Arc::new(Mutex::new(None)),
+            broadcasts: Arc::new(Mutex::new(Vec::new())),
+            locked_inputs: Arc::new(Mutex::new(Vec::new())),
+            lock_calls: Arc::new(Mutex::new(0)),
+            in_mempool: Arc::new(Mutex::new(false)),
             tip: Arc::new(Mutex::new(900)),
             confirmations: Arc::new(Mutex::new(6)),
         }
@@ -82,45 +96,24 @@ fn alice_bob_carol_use_separate_cli_wallets() {
     let registered = run(&alice, &["coin", "register"]);
     assert_eq!(registered["status"], "registered");
     let coin_id = registered["coin_id"].as_str().unwrap().to_owned();
-    let outpoint = format!("{}:0", "42".repeat(32));
-    *core_state.funding.lock().unwrap() = Some(Funding {
-        outpoint: outpoint.clone(),
-        script_hex: registered["funding_script_hex"]
-            .as_str()
-            .unwrap()
-            .to_owned(),
-    });
-    assert_eq!(
-        run(
-            &alice,
-            &[
-                "coin",
-                "fund",
-                "--outpoint",
-                &outpoint,
-                "--amount-sat",
-                &AMOUNT_SAT.to_string(),
-            ],
-        )["status"],
-        "funded"
+    let funded = run(
+        &alice,
+        &[
+            "coin",
+            "fund",
+            "--amount-sat",
+            &AMOUNT_SAT.to_string(),
+            "--delay-blocks",
+            "100",
+            "--max-fee-sat",
+            "1000",
+        ],
     );
-    assert_eq!(
-        run_failure_with_env(
-            &alice,
-            &["coin", "activate", "--locktime", "1000"],
-            "after_prepare",
-        )["error"],
-        "stopped at test failpoint after_prepare"
-    );
-    *core_state.tip.lock().unwrap() = 990;
-    assert_eq!(
-        run_failure(&alice, &["coin", "activate", "--locktime", "1000"])["error"],
-        "latest recovery locktime 1000 must be greater than tip 990 plus reaction margin 20"
-    );
-    assert_eq!(
-        run(&alice, &["coin", "activate", "--locktime", "1050"])["status"],
-        "activated"
-    );
+    assert_eq!(funded["status"], "funding_broadcast");
+    assert_eq!(funded["recovery_secured"], true);
+    assert_eq!(funded["delay_blocks"], 100);
+    let outpoint = funded["outpoint"].as_str().unwrap().to_owned();
+    assert_eq!(core_state.broadcasts.lock().unwrap().len(), 1);
 
     let wrong_request = temporary.path().join("wrong-amount-request.json");
     let wrong_package = temporary.path().join("wrong-amount-package.json");
@@ -182,7 +175,7 @@ fn alice_bob_carol_use_separate_cli_wallets() {
     );
     let bob_request_json: Value =
         serde_json::from_str(&fs::read_to_string(&bob_request).unwrap()).unwrap();
-    assert_eq!(bob_request_json["format_version"], 3);
+    assert_eq!(bob_request_json["format_version"], 4);
     assert_eq!(bob_request_json["protocol_version"], 1);
     assert_eq!(bob_request_json["expected_amount_sat"], AMOUNT_SAT);
     assert_no_raw_handoff(&bob_request_json);
@@ -376,7 +369,7 @@ fn alice_bob_carol_use_separate_cli_wallets() {
         &["receipt", "export", "--output", receipt.to_str().unwrap()],
     );
     let receipt_json: Value = serde_json::from_str(&fs::read_to_string(&receipt).unwrap()).unwrap();
-    assert_eq!(receipt_json["format_version"], 3);
+    assert_eq!(receipt_json["format_version"], 4);
     assert_eq!(receipt_json["protocol_version"], 1);
     assert_no_raw_handoff(&receipt_json);
     let incompatible_receipt = temporary.path().join("protocol-2-receipt.json");
@@ -406,7 +399,6 @@ fn alice_bob_carol_use_separate_cli_wallets() {
         )["status"],
         "receipt_verified"
     );
-    *core_state.tip.lock().unwrap() = 1_100;
     let alice_recovery = temporary.path().join("alice-recovery.hex");
     run(
         &alice,
@@ -417,6 +409,16 @@ fn alice_bob_carol_use_separate_cli_wallets() {
             alice_recovery.to_str().unwrap(),
         ],
     );
+    let bob_recovery = temporary.path().join("bob-recovery.hex");
+    run(
+        &bob,
+        &[
+            "coin",
+            "recovery",
+            "--output",
+            bob_recovery.to_str().unwrap(),
+        ],
+    );
     let recovery = temporary.path().join("carol-recovery.hex");
     run(
         &carol,
@@ -424,8 +426,24 @@ fn alice_bob_carol_use_separate_cli_wallets() {
     );
     let recovery_hex = fs::read_to_string(&recovery).unwrap();
     assert!(recovery_hex.trim().len() > 100);
-    let recovery_tx: Transaction = deserialize(&hex::decode(recovery_hex.trim()).unwrap()).unwrap();
-    assert_eq!(recovery_tx.input[0].witness.len(), 4);
+    let alice_tx: Transaction =
+        deserialize(&hex::decode(fs::read_to_string(&alice_recovery).unwrap().trim()).unwrap())
+            .unwrap();
+    let bob_tx: Transaction =
+        deserialize(&hex::decode(fs::read_to_string(&bob_recovery).unwrap().trim()).unwrap())
+            .unwrap();
+    let carol_tx: Transaction = deserialize(&hex::decode(recovery_hex.trim()).unwrap()).unwrap();
+    assert_eq!(carol_tx.input[0].witness.len(), 4);
+    assert_eq!(alice_tx.lock_time, absolute::LockTime::ZERO);
+    assert_eq!(bob_tx.lock_time, absolute::LockTime::ZERO);
+    assert_eq!(carol_tx.lock_time, absolute::LockTime::ZERO);
+    assert_eq!(alice_tx.input[0].sequence, Sequence::from_height(100));
+    assert_eq!(bob_tx.input[0].sequence, Sequence::from_height(90));
+    assert_eq!(carol_tx.input[0].sequence, Sequence::from_height(80));
+    *core_state.confirmations.lock().unwrap() = 80;
+    let mature_status = run(&carol, &["coin", "status"]);
+    assert_eq!(mature_status["reaction_safe"], false);
+    assert_eq!(mature_status["lifecycle"], "owned");
     assert_ne!(
         fs::read_to_string(alice_recovery).unwrap(),
         fs::read_to_string(temporary.path().join("carol-recovery.hex")).unwrap()
@@ -435,7 +453,7 @@ fn alice_bob_carol_use_separate_cli_wallets() {
     assert!(encrypted_package.contains("ciphertext"));
     assert!(!encrypted_package.contains("client_secret"));
     let encrypted_package_json: Value = serde_json::from_str(&encrypted_package).unwrap();
-    assert_eq!(encrypted_package_json["format_version"], 3);
+    assert_eq!(encrypted_package_json["format_version"], 4);
     assert_no_raw_handoff(&encrypted_package_json);
     assert!(
         !fs::read_to_string(alice.join("wallet.enc"))
@@ -445,7 +463,7 @@ fn alice_bob_carol_use_separate_cli_wallets() {
 }
 
 #[test]
-fn committed_superseded_activation_is_recovered() {
+fn funding_is_never_broadcast_before_recovery_is_durable() {
     let temporary = tempfile::tempdir().unwrap();
     let cookie = temporary.path().join("bitcoin.cookie");
     fs::write(&cookie, "user:password\n").unwrap();
@@ -457,51 +475,104 @@ fn committed_superseded_activation_is_recovered() {
     let (enclave_url, core_url, core_state) = start_servers();
     let alice = temporary.path().join("alice");
     initialize(&alice, &enclave_url, &core_url, &cookie);
-    let registered = run(&alice, &["coin", "register"]);
-    let outpoint = format!("{}:1", "43".repeat(32));
-    *core_state.funding.lock().unwrap() = Some(Funding {
-        outpoint: outpoint.clone(),
-        script_hex: registered["funding_script_hex"]
-            .as_str()
-            .unwrap()
-            .to_owned(),
-    });
-    run(
-        &alice,
-        &[
-            "coin",
-            "fund",
-            "--outpoint",
-            &outpoint,
-            "--amount-sat",
-            &AMOUNT_SAT.to_string(),
-        ],
-    );
-    run_failure_with_env(
-        &alice,
-        &["coin", "activate", "--locktime", "1000"],
-        "after_prepare",
-    );
-    *core_state.tip.lock().unwrap() = 990;
+    run(&alice, &["coin", "register"]);
+    let fund = [
+        "coin",
+        "fund",
+        "--amount-sat",
+        "100000",
+        "--delay-blocks",
+        "100",
+        "--max-fee-sat",
+        "1000",
+    ];
+
     assert_eq!(
-        run_failure_with_env(
-            &alice,
-            &["coin", "activate", "--locktime", "1050"],
-            "after_prepare",
-        )["error"],
-        "stopped at test failpoint after_prepare"
+        run_failure_with_env(&alice, &fund, "after_funding_prepared")["error"],
+        "stopped at test failpoint after_funding_prepared"
     );
+    assert!(core_state.broadcasts.lock().unwrap().is_empty());
+    assert_eq!(*core_state.lock_calls.lock().unwrap(), 0);
     assert_eq!(
-        run_failure_with_env(
-            &alice,
-            &["coin", "activate", "--locktime", "1050"],
-            "commit_superseded",
-        )["error"],
-        "stopped at test failpoint commit_superseded"
+        run(&alice, &["coin", "status"])["lifecycle"],
+        "funding_prepared"
     );
-    let recovered = run(&alice, &["coin", "activate", "--locktime", "1050"]);
-    assert_eq!(recovered["status"], "activated");
-    assert_eq!(recovered["locktime"], 1000);
+
+    for failpoint in ["after_prepare", "after_sign", "after_response"] {
+        assert_eq!(
+            run_failure_with_env(&alice, &fund, failpoint)["error"],
+            format!("stopped at test failpoint {failpoint}")
+        );
+        assert!(core_state.broadcasts.lock().unwrap().is_empty());
+    }
+
+    assert_eq!(
+        run_failure_without_enclave(&alice, &fund, "after_recovery_secured")["error"],
+        "stopped at test failpoint after_recovery_secured"
+    );
+    assert!(core_state.broadcasts.lock().unwrap().is_empty());
+    assert_eq!(
+        run(&alice, &["coin", "status"])["lifecycle"],
+        "recovery_secured"
+    );
+    let recovery = temporary.path().join("secured-recovery.hex");
+    assert_eq!(
+        run(
+            &alice,
+            &["coin", "recovery", "--output", recovery.to_str().unwrap()],
+        )["status"],
+        "recovery_exported"
+    );
+
+    assert_eq!(
+        run_failure_without_enclave(&alice, &fund, "after_funding_broadcast")["error"],
+        "stopped at test failpoint after_funding_broadcast"
+    );
+    assert_eq!(core_state.broadcasts.lock().unwrap().len(), 1);
+    let completed = run_without_enclave(&alice, &fund);
+    assert_eq!(completed["status"], "funding_broadcast");
+    assert_eq!(core_state.broadcasts.lock().unwrap().len(), 1);
+    *core_state.confirmations.lock().unwrap() = 0;
+    *core_state.in_mempool.lock().unwrap() = false;
+    *core_state.funding.lock().unwrap() = None;
+    let lock_calls = *core_state.lock_calls.lock().unwrap();
+    assert_eq!(
+        run_without_enclave(&alice, &fund)["status"],
+        "already_funded"
+    );
+    assert_eq!(*core_state.lock_calls.lock().unwrap(), lock_calls);
+    let broadcasts = core_state.broadcasts.lock().unwrap();
+    assert_eq!(broadcasts.len(), 2);
+    assert_eq!(broadcasts[0], broadcasts[1]);
+    drop(broadcasts);
+    *core_state.confirmations.lock().unwrap() = 1;
+    *core_state.funding.lock().unwrap() = None;
+    assert_eq!(
+        run_without_enclave(
+            &alice,
+            &[
+                "coin",
+                "fund",
+                "--amount-sat",
+                "100000",
+                "--delay-blocks",
+                "100",
+                "--max-fee-sat",
+                "1000",
+            ],
+        )["status"],
+        "already_funded"
+    );
+    assert_eq!(core_state.broadcasts.lock().unwrap().len(), 2);
+    assert_eq!(
+        deserialize::<Transaction>(
+            &hex::decode(fs::read_to_string(recovery).unwrap().trim()).unwrap()
+        )
+        .unwrap()
+        .input[0]
+            .sequence,
+        Sequence::from_height(100)
+    );
 }
 
 #[test]
@@ -531,33 +602,65 @@ fn default_and_explicit_confirmation_policies_are_enforced() {
             &core_url,
             "--bitcoin-cookie-file",
             cookie.to_str().unwrap(),
+            "--bitcoin-wallet",
+            "funder",
         ],
     );
     let default_config: Value =
         serde_json::from_str(&fs::read_to_string(default_wallet.join("config.json")).unwrap())
             .unwrap();
-    assert_eq!(default_config["format_version"], 3);
+    assert_eq!(default_config["format_version"], 4);
     assert_eq!(default_config["protocol_version"], 1);
     assert_eq!(default_config["min_confirmations"], 6);
     let registered = run(&default_wallet, &["coin", "register"]);
-    let default_outpoint = format!("{}:0", "44".repeat(32));
-    *core_state.funding.lock().unwrap() = Some(Funding {
-        outpoint: default_outpoint.clone(),
-        script_hex: registered["funding_script_hex"]
-            .as_str()
-            .unwrap()
-            .to_owned(),
-    });
+    let funded = run(
+        &default_wallet,
+        &[
+            "coin",
+            "fund",
+            "--amount-sat",
+            "100000",
+            "--delay-blocks",
+            "100",
+            "--max-fee-sat",
+            "1000",
+        ],
+    );
+    let default_outpoint = funded["outpoint"].as_str().unwrap();
+    assert_eq!(
+        run(&default_wallet, &["coin", "status"])["lifecycle"],
+        "funding_broadcast"
+    );
+
+    let receiver = temporary.path().join("default-receiver");
+    initialize(&receiver, &enclave_url, &core_url, &cookie);
+    let request = temporary.path().join("default-request.json");
+    let package = temporary.path().join("default-package.json");
+    run(
+        &receiver,
+        &[
+            "transfer",
+            "request",
+            "--coin-id",
+            registered["coin_id"].as_str().unwrap(),
+            "--outpoint",
+            default_outpoint,
+            "--amount-sat",
+            "100000",
+            "--output",
+            request.to_str().unwrap(),
+        ],
+    );
     assert_eq!(
         run_failure(
             &default_wallet,
             &[
                 "coin",
-                "fund",
-                "--outpoint",
-                &default_outpoint,
-                "--amount-sat",
-                &AMOUNT_SAT.to_string(),
+                "sign",
+                "--request",
+                request.to_str().unwrap(),
+                "--output",
+                package.to_str().unwrap(),
             ],
         )["error"],
         "funding output has 5 confirmations; 6 required"
@@ -569,28 +672,26 @@ fn default_and_explicit_confirmation_policies_are_enforced() {
         serde_json::from_str(&fs::read_to_string(explicit_wallet.join("config.json")).unwrap())
             .unwrap();
     assert_eq!(explicit_config["min_confirmations"], 1);
-    let registered = run(&explicit_wallet, &["coin", "register"]);
-    let explicit_outpoint = format!("{}:0", "45".repeat(32));
-    *core_state.funding.lock().unwrap() = Some(Funding {
-        outpoint: explicit_outpoint.clone(),
-        script_hex: registered["funding_script_hex"]
-            .as_str()
-            .unwrap()
-            .to_owned(),
-    });
+    run(&explicit_wallet, &["coin", "register"]);
     assert_eq!(
         run(
             &explicit_wallet,
             &[
                 "coin",
                 "fund",
-                "--outpoint",
-                &explicit_outpoint,
                 "--amount-sat",
-                &AMOUNT_SAT.to_string(),
+                "100000",
+                "--delay-blocks",
+                "100",
+                "--max-fee-sat",
+                "1000",
             ],
         )["status"],
-        "funded"
+        "funding_broadcast"
+    );
+    assert_eq!(
+        run(&explicit_wallet, &["coin", "status"])["lifecycle"],
+        "owned"
     );
 }
 
@@ -647,11 +748,21 @@ fn mainnet_is_unavailable_from_cli_and_handcrafted_config() {
 #[test]
 fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
     let temporary = tempfile::tempdir().unwrap();
-    let (enclave_url, explorer_url, explorer_state) = start_explorer_servers();
+    let cookie = temporary.path().join("bitcoin.cookie");
+    fs::write(&cookie, "user:password\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&cookie, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let (enclave_url, core_url, _core_state) = start_servers();
+    let (_unused_enclave, explorer_url, explorer_state) = start_explorer_servers();
     let explorer_url = format!("{explorer_url}/api");
     let alice = temporary.path().join("alice");
+    let bob = temporary.path().join("bob");
+    initialize(&alice, &enclave_url, &core_url, &cookie);
     let output = run(
-        &alice,
+        &bob,
         &[
             "init",
             "--network",
@@ -668,7 +779,20 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
     assert_eq!(output["status"], "initialized");
 
     let registered = run(&alice, &["coin", "register"]);
-    let outpoint = format!("{}:0", "42".repeat(32));
+    let funded = run(
+        &alice,
+        &[
+            "coin",
+            "fund",
+            "--amount-sat",
+            "100000",
+            "--delay-blocks",
+            "100",
+            "--max-fee-sat",
+            "1000",
+        ],
+    );
+    let outpoint = funded["outpoint"].as_str().unwrap().to_owned();
     *explorer_state.funding.lock().unwrap() = Some(Funding {
         outpoint: outpoint.clone(),
         script_hex: registered["funding_script_hex"]
@@ -676,23 +800,50 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
             .unwrap()
             .to_owned(),
     });
+    let request = temporary.path().join("bob-request.json");
+    let package = temporary.path().join("alice-to-bob.json");
     run(
-        &alice,
+        &bob,
         &[
-            "coin",
-            "fund",
+            "transfer",
+            "request",
+            "--coin-id",
+            registered["coin_id"].as_str().unwrap(),
             "--outpoint",
             &outpoint,
             "--amount-sat",
             &AMOUNT_SAT.to_string(),
+            "--output",
+            request.to_str().unwrap(),
         ],
     );
-    run(&alice, &["coin", "activate", "--locktime", "1000"]);
+    run(
+        &alice,
+        &[
+            "coin",
+            "sign",
+            "--request",
+            request.to_str().unwrap(),
+            "--output",
+            package.to_str().unwrap(),
+        ],
+    );
+    run(
+        &bob,
+        &[
+            "transfer",
+            "accept",
+            "--request",
+            request.to_str().unwrap(),
+            "--package",
+            package.to_str().unwrap(),
+        ],
+    );
 
     let destination = destination_address();
     assert!(
         run_failure(
-            &alice,
+            &bob,
             &[
                 "coin",
                 "exit",
@@ -709,15 +860,16 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
 
     let recovery = temporary.path().join("recovery.hex");
     run(
-        &alice,
+        &bob,
         &["coin", "recovery", "--output", recovery.to_str().unwrap()],
     );
     let parent_hex = fs::read_to_string(&recovery).unwrap().trim().to_owned();
 
     *explorer_state.tip.lock().unwrap() = 1_000;
+    *explorer_state.confirmations.lock().unwrap() = 90;
     assert_eq!(
         run_failure(
-            &alice,
+            &bob,
             &[
                 "coin",
                 "exit",
@@ -734,7 +886,7 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
     assert!(explorer_state.packages.lock().unwrap().is_empty());
     assert!(
         run_failure(
-            &alice,
+            &bob,
             &[
                 "coin",
                 "exit",
@@ -751,7 +903,7 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
     assert!(explorer_state.packages.lock().unwrap().is_empty());
     assert!(
         run_failure(
-            &alice,
+            &bob,
             &[
                 "coin",
                 "exit",
@@ -769,7 +921,7 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
     );
     assert!(explorer_state.packages.lock().unwrap().is_empty());
     let exited = run(
-        &alice,
+        &bob,
         &[
             "coin",
             "exit",
@@ -800,6 +952,7 @@ fn destination_address() -> String {
 struct ExplorerState {
     funding: Arc<Mutex<Option<Funding>>>,
     tip: Arc<Mutex<u64>>,
+    confirmations: Arc<Mutex<u32>>,
     packages: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
@@ -813,6 +966,7 @@ fn start_explorer_servers() -> (String, String, ExplorerState) {
     let explorer_state = ExplorerState {
         funding: Arc::new(Mutex::new(None)),
         tip: Arc::new(Mutex::new(900)),
+        confirmations: Arc::new(Mutex::new(6)),
         packages: Arc::new(Mutex::new(Vec::new())),
     };
     let server_state = explorer_state.clone();
@@ -866,11 +1020,13 @@ fn funding_tx_json(state: &ExplorerState, txid: &str) -> Option<Value> {
         "value": AMOUNT_SAT,
         "scriptpubkey": funding.script_hex,
     }));
+    let tip = *state.tip.lock().unwrap();
+    let confirmations = u64::from(*state.confirmations.lock().unwrap());
     Some(json!({
         "txid": txid,
         "status": {
             "confirmed": true,
-            "block_height": *state.tip.lock().unwrap() - 5,
+            "block_height": tip - confirmations + 1,
             "block_hash": "11".repeat(32),
         },
         "vin": [{ "is_coinbase": false }],
@@ -941,6 +1097,8 @@ fn initialize(directory: &Path, enclave_url: &str, core_url: &str, cookie: &Path
             core_url,
             "--bitcoin-cookie-file",
             cookie.to_str().unwrap(),
+            "--bitcoin-wallet",
+            "funder",
             "--min-confirmations",
             "1",
         ],
@@ -1019,6 +1177,40 @@ fn run_failure_with_env(directory: &Path, arguments: &[&str], failpoint: &str) -
     serde_json::from_slice(&output.stderr).unwrap()
 }
 
+fn run_failure_without_enclave(directory: &Path, arguments: &[&str], failpoint: &str) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_tinylayer-wallet"))
+        .arg("--data-dir")
+        .arg(directory)
+        .arg("--json")
+        .args(arguments)
+        .env("ENCLAVIA_WALLET_PASSWORD", PASSWORD)
+        .env("ENCLAVIA_WALLET_TEST_FAILPOINT", failpoint)
+        .env("ENCLAVIA_WALLET_TEST_DISABLE_ENCLAVE", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "command unexpectedly succeeded");
+    serde_json::from_slice(&output.stderr).unwrap()
+}
+
+fn run_without_enclave(directory: &Path, arguments: &[&str]) -> Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_tinylayer-wallet"))
+        .arg("--data-dir")
+        .arg(directory)
+        .arg("--json")
+        .args(arguments)
+        .env("ENCLAVIA_WALLET_PASSWORD", PASSWORD)
+        .env("ENCLAVIA_WALLET_TEST_DISABLE_ENCLAVE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "command failed without enclave:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 fn start_servers() -> (String, String, CoreState) {
     let enclave_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let core_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1036,6 +1228,7 @@ fn start_servers() -> (String, String, CoreState) {
             let core_listener = tokio::net::TcpListener::from_std(core_listener).unwrap();
             let core = Router::new()
                 .route("/", post(core_rpc))
+                .route("/wallet/{wallet}", post(core_rpc))
                 .with_state(server_state);
             ready_tx.send(()).unwrap();
             let _ = tokio::join!(
@@ -1054,6 +1247,158 @@ fn start_servers() -> (String, String, CoreState) {
 
 async fn core_rpc(State(state): State<CoreState>, Json(request): Json<RpcRequest>) -> Json<Value> {
     let result = match request.method.as_str() {
+        "getwalletinfo" => json!({
+            "walletname": "funder",
+            "private_keys_enabled": true,
+        }),
+        "walletcreatefundedpsbt" => {
+            assert_eq!(request.params[3]["minconf"], 1);
+            assert_eq!(request.params[3]["include_unsafe"], false);
+            assert_eq!(request.params[3]["lockUnspents"], true);
+            assert_eq!(request.params[3]["replaceable"], false);
+            let outputs = request
+                .params
+                .get(1)
+                .and_then(Value::as_object)
+                .expect("funding outputs object");
+            let (address, value) = outputs.iter().next().expect("one funding output");
+            let address = address
+                .parse::<Address<NetworkUnchecked>>()
+                .unwrap()
+                .require_network(bitcoin::Network::Regtest)
+                .unwrap();
+            let amount = Amount::from_btc(value.as_f64().unwrap()).unwrap();
+            let mut witness = Witness::new();
+            witness.push([1; 64]);
+            let transaction = Transaction {
+                version: Version::TWO,
+                lock_time: absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([0x77; 32]), 0),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness,
+                }],
+                output: vec![TxOut {
+                    value: amount,
+                    script_pubkey: address.script_pubkey(),
+                }],
+            };
+            *state.prepared.lock().unwrap() = Some(transaction);
+            json!({ "psbt": "prepared-psbt", "fee": 0.000001, "changepos": -1 })
+        }
+        "walletprocesspsbt" => json!({ "psbt": "signed-psbt", "complete": true }),
+        "finalizepsbt" => {
+            let transaction = state
+                .prepared
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("prepared funding transaction");
+            json!({ "hex": serialize_hex(&transaction), "complete": true })
+        }
+        "listlockunspent" => json!(
+            state
+                .locked_inputs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|outpoint| json!({
+                    "txid": outpoint.txid.to_string(),
+                    "vout": outpoint.vout,
+                }))
+                .collect::<Vec<_>>()
+        ),
+        "lockunspent" => {
+            assert_eq!(request.params[0], false);
+            assert_eq!(request.params[2], true);
+            *state.lock_calls.lock().unwrap() += 1;
+            let outputs = request.params[1].as_array().unwrap();
+            let mut locked = state.locked_inputs.lock().unwrap();
+            for output in outputs {
+                let outpoint = OutPoint::new(
+                    output["txid"].as_str().unwrap().parse().unwrap(),
+                    output["vout"].as_u64().unwrap() as u32,
+                );
+                if !locked.contains(&outpoint) {
+                    locked.push(outpoint);
+                }
+            }
+            json!(true)
+        }
+        "testmempoolaccept" => {
+            let raw = request.params[0][0].as_str().unwrap();
+            let transaction: Transaction = deserialize(&hex::decode(raw).unwrap()).unwrap();
+            json!([{
+                "txid": transaction.compute_txid().to_string(),
+                "allowed": true,
+                "vsize": transaction.vsize(),
+                "fees": { "base": 0.000001 }
+            }])
+        }
+        "gettransaction" => {
+            let requested = request.params[0].as_str().unwrap();
+            let raw = state
+                .broadcasts
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|raw| {
+                    deserialize::<Transaction>(&hex::decode(raw).unwrap())
+                        .unwrap()
+                        .compute_txid()
+                        .to_string()
+                        == requested
+                })
+                .cloned();
+            let Some(raw) = raw else {
+                return Json(json!({
+                    "result": Value::Null,
+                    "error": { "code": -5, "message": "Invalid or non-wallet transaction id" },
+                    "id": request.id,
+                }));
+            };
+            json!({
+                "confirmations": *state.confirmations.lock().unwrap() as i32,
+                "txid": requested,
+                "walletconflicts": [],
+                "hex": raw,
+            })
+        }
+        "getmempoolentry" => {
+            let requested = request.params[0].as_str().unwrap();
+            let in_mempool = *state.confirmations.lock().unwrap() == 0
+                && *state.in_mempool.lock().unwrap()
+                && state.broadcasts.lock().unwrap().iter().any(|raw| {
+                    deserialize::<Transaction>(&hex::decode(raw).unwrap())
+                        .unwrap()
+                        .compute_txid()
+                        .to_string()
+                        == requested
+                });
+            if !in_mempool {
+                return Json(json!({
+                    "result": Value::Null,
+                    "error": { "code": -5, "message": "Transaction not in mempool" },
+                    "id": request.id,
+                }));
+            }
+            json!({ "vsize": 100 })
+        }
+        "sendrawtransaction" => {
+            let raw = request.params[0].as_str().unwrap().to_owned();
+            let transaction: Transaction = deserialize(&hex::decode(&raw).unwrap()).unwrap();
+            let txid = transaction.compute_txid();
+            let output = transaction.output.first().unwrap();
+            *state.funding.lock().unwrap() = Some(Funding {
+                outpoint: OutPoint::new(txid, 0).to_string(),
+                script_hex: hex::encode(output.script_pubkey.as_bytes()),
+            });
+            state.locked_inputs.lock().unwrap().clear();
+            state.broadcasts.lock().unwrap().push(raw);
+            *state.in_mempool.lock().unwrap() = true;
+            json!(txid.to_string())
+        }
         "getblockchaininfo" => json!({
             "chain": "regtest",
             "blocks": *state.tip.lock().unwrap(),

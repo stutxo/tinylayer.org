@@ -13,7 +13,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use enclavia::Pcrs;
 use serde_json::{Value, json};
 use tinylayer_client::{
-    CoinStatus, INITIAL_HANDOFF, LOCKTIME_STEP, NetworkId, PROTOCOL_VERSION, authorization,
+    CoinStatus, DELAY_STEP, INITIAL_HANDOFF, NetworkId, PROTOCOL_VERSION, authorization,
     build_exit_child, capability_hash, complete_recovery, complete_registration, funding_address,
     funding_script, prepare_recovery, prepare_registration, verify_history, verify_recovery,
     verify_sign_response, verify_status,
@@ -21,21 +21,24 @@ use tinylayer_client::{
 
 use crate::{
     model::{
-        ChainConfig, Config, EnclaveConfig, FILE_FORMAT_VERSION, IncomingTransfer,
-        OutgoingTransfer, PendingOperation, PendingRecovery, Receipt, RecoveryAttempt,
-        RecoveryPurpose, RecoveryStage, TransferEnvelope, TransferPayload, TransferRequest,
-        WalletCoin, WalletState, decrypt_transfer, encrypt_transfer, parse_hex32,
+        ChainConfig, Config, EnclaveConfig, FILE_FORMAT_VERSION, FundingJournal, FundingStage,
+        IncomingTransfer, OutgoingTransfer, PendingOperation, PendingRecovery, Receipt,
+        RecoveryAttempt, RecoveryPurpose, RecoveryStage, TransferEnvelope, TransferPayload,
+        TransferRequest, WalletCoin, WalletState, decrypt_transfer, encrypt_transfer, parse_hex32,
         random_secret_key, secret_xonly,
     },
     services::{
         Chain, EnclaveConnection, default_explorer_url, network_name, require_reaction_margin,
-        validate_core_config, validate_explorer_url, verify_public_history,
+        validate_core_config, validate_core_wallet_name, validate_explorer_url,
+        verify_public_history,
     },
     store::{
         WalletStore, ensure_destination_available, load_config, read_json_source, read_password,
         write_json_destination, write_text_destination,
     },
 };
+
+const DEFAULT_RECOVERY_DELAY_BLOCKS: u32 = 2_016;
 
 #[derive(Debug, Parser)]
 #[command(name = "tinylayer-wallet", version, about = "Tinylayer native wallet")]
@@ -110,6 +113,9 @@ struct InitArgs {
     bitcoin_rpc_url: Option<String>,
     #[arg(long, value_name = "FILE")]
     bitcoin_cookie_file: Option<PathBuf>,
+    /// Loaded Bitcoin Core wallet used to construct and broadcast funding.
+    #[arg(long)]
+    bitcoin_wallet: Option<String>,
     #[arg(long, default_value_t = 6)]
     min_confirmations: u32,
     #[arg(long, default_value_t = 20)]
@@ -126,13 +132,13 @@ enum CoinCommand {
     Register,
     Fund {
         #[arg(long)]
-        outpoint: OutPoint,
-        #[arg(long)]
         amount_sat: u64,
-    },
-    Activate {
-        #[arg(long)]
-        locktime: u32,
+        #[arg(long, default_value_t = DEFAULT_RECOVERY_DELAY_BLOCKS)]
+        delay_blocks: u32,
+        #[arg(long, value_name = "SAT_VB", default_value_t = 1)]
+        fee_rate: u64,
+        #[arg(long, value_name = "SAT")]
+        max_fee_sat: u64,
     },
     Status,
     Sign {
@@ -153,6 +159,9 @@ enum CoinCommand {
         fee_rate: Option<u64>,
         #[arg(long, value_name = "SAT")]
         max_fee_sat: u64,
+        /// Build and verify the package without submitting it.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -206,20 +215,21 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Coin { command } => match command {
             CoinCommand::Register => register_coin(&data_dir, password_file.as_deref(), json).await,
             CoinCommand::Fund {
-                outpoint,
                 amount_sat,
+                delay_blocks,
+                fee_rate,
+                max_fee_sat,
             } => {
                 fund_coin(
                     &data_dir,
                     password_file.as_deref(),
                     json,
-                    outpoint,
                     amount_sat,
+                    delay_blocks,
+                    fee_rate,
+                    max_fee_sat,
                 )
                 .await
-            }
-            CoinCommand::Activate { locktime } => {
-                activate_coin(&data_dir, password_file.as_deref(), json, locktime).await
             }
             CoinCommand::Status => coin_status(&data_dir, password_file.as_deref(), json).await,
             CoinCommand::Sign { request, output } => {
@@ -232,6 +242,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 destination,
                 fee_rate,
                 max_fee_sat,
+                dry_run,
             } => {
                 exit_coin(
                     &data_dir,
@@ -240,6 +251,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     &destination,
                     fee_rate,
                     max_fee_sat,
+                    dry_run,
                 )
                 .await
             }
@@ -294,8 +306,8 @@ async fn initialize(
         "minimum confirmations must be positive"
     );
     ensure!(
-        args.min_reaction_blocks >= LOCKTIME_STEP,
-        "minimum reaction margin must be at least {LOCKTIME_STEP} blocks"
+        args.min_reaction_blocks >= DELAY_STEP,
+        "minimum reaction margin must be at least {DELAY_STEP} blocks"
     );
     let network = NetworkId::from(args.network);
     let enclave = if args.unsafe_plaintext {
@@ -339,29 +351,34 @@ async fn initialize(
         args.chain_url,
         args.bitcoin_rpc_url,
         args.bitcoin_cookie_file,
+        args.bitcoin_wallet,
     ) {
-        (Some(url), None, None) => {
+        (Some(url), None, None, None) => {
             validate_explorer_url(&url)?;
             ChainConfig::Explorer { url }
         }
-        (None, Some(rpc_url), Some(cookie_file)) => {
+        (None, Some(rpc_url), Some(cookie_file), Some(wallet_name)) => {
             ensure!(
                 network == NetworkId::Regtest,
                 "Bitcoin Core RPC is restricted to regtest"
             );
             validate_core_config(&rpc_url, &cookie_file)?;
+            validate_core_wallet_name(&wallet_name)?;
             ChainConfig::CoreRpc {
                 rpc_url,
                 cookie_file,
+                wallet_name,
             }
         }
-        (None, None, None) => {
+        (None, None, None, None) => {
             let url = default_explorer_url(network)
                 .context("regtest requires --chain-url or Bitcoin Core RPC options")?
                 .to_owned();
             ChainConfig::Explorer { url }
         }
-        _ => bail!("--chain-url cannot be combined with Bitcoin Core RPC options"),
+        _ => bail!(
+            "--chain-url cannot be combined with Bitcoin Core options; Core requires --bitcoin-rpc-url, --bitcoin-cookie-file, and --bitcoin-wallet"
+        ),
     };
     let config = Config {
         format_version: FILE_FORMAT_VERSION,
@@ -479,6 +496,7 @@ async fn register_coin(
         client_secret,
         keys,
         metadata: None,
+        funding: None,
         current_capability: Some(initial_capability),
         current_handoff: Some(INITIAL_HANDOFF),
         withdrawal_secret: None,
@@ -501,253 +519,176 @@ async fn fund_coin(
     directory: &Path,
     password_file: Option<&Path>,
     json_output: bool,
-    outpoint: OutPoint,
     amount_sat: u64,
+    delay_blocks: u32,
+    fee_rate_sat_vb: u64,
+    max_fee_sat: u64,
 ) -> Result<()> {
+    ensure!(
+        u16::try_from(delay_blocks).is_ok(),
+        "recovery delay cannot exceed {} blocks",
+        u16::MAX
+    );
+    require_reaction_margin(0, delay_blocks, 0)?;
     let (store, config) = open_wallet(directory, password_file)?;
     let mut state = store.load()?;
-    ensure!(state.pending.is_none(), "wallet has a pending operation");
-    let coin = state.coin.as_mut().context("register a coin first")?;
-    ensure!(
-        coin.current_capability.is_some(),
-        "coin has already been transferred"
-    );
-    ensure!(coin.history.is_empty(), "coin funding is already active");
-    let metadata = coin
-        .keys
-        .clone()
-        .metadata(config.network, outpoint, amount_sat);
-    if let Some(existing) = &coin.metadata {
-        ensure!(
-            existing == &metadata,
-            "coin is already bound to different funding"
-        );
-    }
-    let enclave = connect_verified(&config).await?;
-    let status = enclave.status(coin.keys.coin_id).await?;
-    verify_status(&coin.keys, &status)?;
-    let capability = coin
-        .current_capability
-        .context("coin has already been transferred")?;
-    let handoff = coin
-        .current_handoff
-        .context("registered coin has no current handoff token")?;
-    ensure!(
-        handoff == INITIAL_HANDOFF
-            && status.authorization
-                == authorization(&coin.keys.coin_id, &capability_hash(&capability), &handoff,),
-        "wallet authorization does not match enclave"
-    );
-    ensure!(
-        status.signature_count == 0,
-        "coin already has signed recoveries"
-    );
-    let chain = Chain::connect(&config.chain, config.network).await?;
-    let observation = chain
-        .verify_funding(&metadata, config.min_confirmations)
-        .await?;
-    coin.metadata = Some(metadata);
-    store.save(&state)?;
-    emit(
-        json_output,
-        json!({
-            "status": "funded",
-            "outpoint": outpoint.to_string(),
-            "amount_sat": amount_sat,
-            "confirmations": observation.confirmations,
-            "tip_height": observation.tip_height,
-        }),
-        format!(
-            "Verified funding {outpoint} ({amount_sat} sat, {} confirmations)",
-            observation.confirmations
-        ),
-    )
-}
-
-async fn activate_coin(
-    directory: &Path,
-    password_file: Option<&Path>,
-    json_output: bool,
-    locktime: u32,
-) -> Result<()> {
-    let (store, config) = open_wallet(directory, password_file)?;
-    let mut state = store.load()?;
-    let enclave = connect_verified(&config).await?;
-    if let Some(PendingOperation::Recovery(pending)) = &state.pending {
-        ensure!(
-            matches!(&pending.purpose, RecoveryPurpose::Activate { .. }),
-            "wallet has a pending transfer; resume coin sign"
-        );
-        let pending_locktime = match &pending.stage {
-            RecoveryStage::Prepared { current, .. } => current.locktime,
-            RecoveryStage::Responded { attempt, .. } => attempt.locktime,
-        };
-        if pending_locktime != locktime
-            && let RecoveryStage::Prepared {
-                current,
-                superseded,
-            } = &pending.stage
-        {
-            let coin = state
-                .coin
-                .as_ref()
-                .context("pending activation coin is missing")?;
-            let metadata = coin
-                .metadata
-                .as_ref()
-                .context("pending activation metadata is missing")?;
-            let status = enclave.status(coin.keys.coin_id).await?;
-            verify_status(&coin.keys, &status)?;
-            let prior_committed = attempt_committed(&status, current)?
-                || superseded
-                    .iter()
-                    .map(|attempt| attempt_committed(&status, attempt))
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .any(|committed| committed);
-            if !prior_committed {
-                ensure!(
-                    attempt_uncommitted(&status, current),
-                    "pending activation does not match live enclave state"
-                );
-                let chain = Chain::connect(&config.chain, config.network).await?;
-                let observation = chain
-                    .verify_funding(metadata, config.min_confirmations)
-                    .await?;
-                require_reaction_margin(
-                    observation.tip_height,
-                    locktime,
-                    config.min_reaction_blocks,
-                )?;
-                let (next_capability, withdrawal_secret) = match &pending.purpose {
-                    RecoveryPurpose::Activate {
-                        next_capability,
-                        withdrawal_secret,
-                    } => (*next_capability, *withdrawal_secret),
-                    RecoveryPurpose::Transfer { .. } => unreachable!(),
-                };
-                ensure!(
-                    current.request.next_capability_hash == capability_hash(&next_capability),
-                    "pending activation capability is inconsistent"
-                );
-                let withdrawal = SecretKey::from_slice(&withdrawal_secret)
-                    .context("pending withdrawal key is invalid")?;
-                let (request, prepared) = prepare_recovery(
-                    metadata,
-                    &status,
-                    coin.client_secret,
-                    current.request.current_capability,
-                    current.request.current_handoff,
-                    current.request.next_capability_hash,
-                    secret_xonly(&withdrawal),
-                    locktime,
-                    observation.tip_height,
-                )?;
-                let pending = state.pending.take().expect("pending activation exists");
-                let PendingOperation::Recovery(PendingRecovery { purpose, stage }) = pending else {
-                    unreachable!();
-                };
-                let RecoveryStage::Prepared {
-                    current,
-                    mut superseded,
-                } = stage
-                else {
-                    unreachable!();
-                };
-                superseded.push(*current);
-                state.pending = Some(PendingOperation::Recovery(PendingRecovery {
-                    purpose,
-                    stage: RecoveryStage::Prepared {
-                        current: Box::new(RecoveryAttempt {
-                            expected_signature_count: status.signature_count,
-                            locktime,
-                            request,
-                            prepared: Box::new(prepared),
-                        }),
-                        superseded,
-                    },
-                }));
-                store.save(&state)?;
-                test_failpoint("after_prepare")?;
-            }
+    let funding_stage_at_start = state
+        .coin
+        .as_ref()
+        .and_then(|coin| coin.funding.as_ref())
+        .map(|funding| funding.stage);
+    let needs_enclave = match state.pending.as_ref() {
+        Some(PendingOperation::Recovery(PendingRecovery {
+            purpose: RecoveryPurpose::Fund { .. },
+            stage: RecoveryStage::Responded { .. },
+        })) => false,
+        Some(_) => true,
+        None => {
+            funding_stage_at_start.is_none()
+                || funding_stage_at_start == Some(FundingStage::Prepared)
         }
-    } else if state.pending.is_some() {
-        bail!("wallet has a pending registration; resume coin register");
+    };
+    let enclave = if needs_enclave {
+        Some(connect_verified(&config).await?)
     } else {
-        let coin = state.coin.as_ref().context("register a coin first")?;
-        if !coin.history.is_empty() {
-            ensure!(
-                coin.current_capability.is_some(),
-                "coin has already been transferred"
-            );
-            ensure!(
-                coin.accepted_request.is_none()
-                    && coin.history.len() == 1
-                    && coin.history[0].locktime == locktime,
-                "coin is already active with a different recovery"
-            );
-            let metadata = coin
-                .metadata
-                .as_ref()
-                .context("active coin has no funding metadata")?;
-            let capability = coin
-                .current_capability
-                .context("coin has already been transferred")?;
-            let handoff = coin
-                .current_handoff
-                .context("active coin has no current handoff token")?;
-            let withdrawal = SecretKey::from_slice(
-                &coin
-                    .withdrawal_secret
-                    .context("active coin has no withdrawal key")?,
-            )
-            .context("saved withdrawal key is invalid")?;
-            let status = enclave.status(coin.keys.coin_id).await?;
-            let chain = Chain::connect(&config.chain, config.network).await?;
-            chain
-                .verify_funding(metadata, config.min_confirmations)
-                .await?;
-            verify_history(
-                metadata,
-                &status,
-                coin.client_secret,
-                capability,
-                handoff,
-                secret_xonly(&withdrawal),
-                0,
-                &coin.history,
-            )?;
-            return emit_activation(json_output, coin, true);
-        }
+        None
+    };
+    let chain = Chain::connect(&config.chain, config.network).await?;
+    if state
+        .coin
+        .as_ref()
+        .context("register a coin first")?
+        .funding
+        .is_none()
+    {
+        ensure!(state.pending.is_none(), "wallet has a pending operation");
+        let coin = state.coin.as_ref().expect("coin checked above");
+        ensure!(
+            coin.current_capability.is_some()
+                && coin.current_handoff == Some(INITIAL_HANDOFF)
+                && coin.metadata.is_none()
+                && coin.history.is_empty(),
+            "coin has already left the registration stage"
+        );
+        let enclave = enclave.as_ref().context("funding requires the enclave")?;
+        let status = enclave.status(coin.keys.coin_id).await?;
+        verify_status(&coin.keys, &status)?;
+        let capability = coin.current_capability.expect("capability checked above");
+        ensure!(
+            status.signature_count == 0
+                && status.authorization
+                    == authorization(
+                        &coin.keys.coin_id,
+                        &capability_hash(&capability),
+                        &INITIAL_HANDOFF,
+                    ),
+            "wallet authorization does not match enclave"
+        );
+        require_reaction_margin(0, delay_blocks, config.min_reaction_blocks)?;
+        let prepared =
+            chain.prepare_funding(&coin.keys, amount_sat, fee_rate_sat_vb, max_fee_sat)?;
+        let metadata = coin
+            .keys
+            .clone()
+            .metadata(config.network, prepared.outpoint, amount_sat);
+        let coin = state.coin.as_mut().expect("coin checked above");
+        coin.metadata = Some(metadata);
+        coin.funding = Some(FundingJournal {
+            transaction: prepared.transaction,
+            delay_blocks,
+            fee_rate_sat_vb,
+            max_fee_sat,
+            fee_sat: prepared.fee_sat,
+            stage: FundingStage::Prepared,
+        });
+        store.save(&state)?;
+        test_failpoint("after_funding_prepared")?;
+    }
+
+    {
+        let coin = state
+            .coin
+            .as_ref()
+            .context("prepared funding coin is missing")?;
         let metadata = coin
             .metadata
             .as_ref()
-            .context("bind and verify funding first")?;
-        let capability = coin
-            .current_capability
-            .context("coin has already been transferred")?;
+            .context("prepared funding metadata is missing")?;
+        let funding = coin
+            .funding
+            .as_ref()
+            .context("prepared funding journal is missing")?;
+        ensure!(
+            metadata.amount_sat == amount_sat
+                && funding.delay_blocks == delay_blocks
+                && funding.fee_rate_sat_vb == fee_rate_sat_vb
+                && funding.max_fee_sat == max_fee_sat,
+            "saved funding policy does not match this command"
+        );
+        ensure!(
+            funding.fee_sat <= max_fee_sat,
+            "saved funding fee exceeds this command's maximum"
+        );
+    }
+
+    if let Some(PendingOperation::Recovery(pending)) = &state.pending {
+        ensure!(
+            matches!(&pending.purpose, RecoveryPurpose::Fund { .. }),
+            "wallet has a pending transfer; resume coin sign"
+        );
+        let pending_delay = match &pending.stage {
+            RecoveryStage::Prepared { attempt } => attempt.delay_blocks,
+            RecoveryStage::Responded { attempt, .. } => attempt.delay_blocks,
+        };
+        ensure!(
+            pending_delay == delay_blocks,
+            "pending funding recovery uses a different delay"
+        );
+    } else if state.pending.is_some() {
+        bail!("wallet has a pending registration; resume coin register");
+    }
+
+    let funding_stage = state
+        .coin
+        .as_ref()
+        .and_then(|coin| coin.funding.as_ref())
+        .map(|funding| funding.stage)
+        .context("prepared funding journal is missing")?;
+    if funding_stage == FundingStage::Prepared && state.pending.is_none() {
+        let coin = state
+            .coin
+            .as_ref()
+            .context("prepared funding coin is missing")?;
+        let metadata = coin
+            .metadata
+            .as_ref()
+            .context("prepared funding metadata is missing")?;
+        let funding = coin
+            .funding
+            .as_ref()
+            .context("prepared funding journal is missing")?;
+        chain.validate_prepared_funding(metadata, &funding.transaction)?;
+        let enclave = enclave.as_ref().context("funding requires the enclave")?;
         let status = enclave.status(coin.keys.coin_id).await?;
         verify_status(&coin.keys, &status)?;
         ensure!(
             status.signature_count == 0,
             "coin already has signed recoveries"
         );
+        let capability = coin
+            .current_capability
+            .context("coin has already been transferred")?;
         let handoff = coin
             .current_handoff
             .context("registered coin has no current handoff token")?;
         ensure!(
             status.authorization
-                == authorization(&coin.keys.coin_id, &capability_hash(&capability), &handoff,),
+                == authorization(&coin.keys.coin_id, &capability_hash(&capability), &handoff),
             "wallet authorization does not match enclave"
         );
-        let chain = Chain::connect(&config.chain, config.network).await?;
-        let observation = chain
-            .verify_funding(metadata, config.min_confirmations)
-            .await?;
-        require_reaction_margin(observation.tip_height, locktime, config.min_reaction_blocks)?;
         let next_capability = rand::random();
         let withdrawal = random_secret_key();
-        let (sign_request, prepared) = prepare_recovery(
+        let (request, prepared) = prepare_recovery(
             metadata,
             &status,
             coin.client_secret,
@@ -755,36 +696,89 @@ async fn activate_coin(
             handoff,
             capability_hash(&next_capability),
             secret_xonly(&withdrawal),
-            locktime,
-            observation.tip_height,
+            delay_blocks,
+            0,
         )?;
         state.pending = Some(PendingOperation::Recovery(PendingRecovery {
-            purpose: RecoveryPurpose::Activate {
+            purpose: RecoveryPurpose::Fund {
                 next_capability,
                 withdrawal_secret: withdrawal.secret_bytes(),
             },
             stage: RecoveryStage::Prepared {
-                current: Box::new(RecoveryAttempt {
+                attempt: Box::new(RecoveryAttempt {
                     expected_signature_count: status.signature_count,
-                    locktime,
-                    request: sign_request,
+                    delay_blocks,
+                    request,
                     prepared: Box::new(prepared),
                 }),
-                superseded: Vec::new(),
             },
         }));
         store.save(&state)?;
         test_failpoint("after_prepare")?;
     }
-    let outcome = finish_pending_recovery(&store, &mut state, &enclave, &config).await?;
+
+    if state.pending.is_some() {
+        let outcome =
+            finish_pending_recovery(&store, &mut state, enclave.as_ref(), &config).await?;
+        ensure!(
+            matches!(outcome, RecoveryOutcome::FundingSecured),
+            "pending operation did not secure funding recovery"
+        );
+    }
+
+    let already_broadcast = state
+        .coin
+        .as_ref()
+        .and_then(|coin| coin.funding.as_ref())
+        .is_some_and(|funding| funding.stage == FundingStage::Broadcast);
+    let coin = state
+        .coin
+        .as_ref()
+        .context("secured funding coin is missing")?;
+    let metadata = coin
+        .metadata
+        .as_ref()
+        .context("secured funding metadata is missing")?;
+    let funding = coin
+        .funding
+        .as_ref()
+        .context("secured funding journal is missing")?;
     ensure!(
-        matches!(outcome, RecoveryOutcome::Activated),
-        "pending operation was not activation"
+        matches!(
+            funding.stage,
+            FundingStage::RecoverySecured | FundingStage::Broadcast
+        ),
+        "funding cannot be broadcast before its recovery is durable"
     );
-    emit_activation(
+    let recovery = coin
+        .history
+        .first()
+        .context("secured funding recovery is missing")?;
+    ensure!(
+        recovery.delay_blocks == funding.delay_blocks,
+        "secured funding recovery has the wrong delay"
+    );
+    verify_recovery(metadata, recovery)?;
+    let txid = chain.broadcast_funding(metadata, &funding.transaction)?;
+    ensure!(
+        txid == metadata.outpoint.txid,
+        "broadcast funding txid does not match recovery outpoint"
+    );
+    if !already_broadcast {
+        test_failpoint("after_funding_broadcast")?;
+        state
+            .coin
+            .as_mut()
+            .and_then(|coin| coin.funding.as_mut())
+            .context("secured funding journal is missing")?
+            .stage = FundingStage::Broadcast;
+        store.save(&state)?;
+    }
+
+    emit_funding(
         json_output,
-        state.coin.as_ref().expect("activated coin exists"),
-        false,
+        state.coin.as_ref().context("funded coin is missing")?,
+        already_broadcast,
     )
 }
 
@@ -815,7 +809,7 @@ async fn sign_transfer(
             request: pending_request,
         } = &pending.purpose
         else {
-            bail!("wallet has a pending activation; resume coin activate");
+            bail!("wallet has pending funding; resume coin fund");
         };
         ensure!(
             pending_request == &request,
@@ -832,7 +826,13 @@ async fn sign_transfer(
             .context("coin has no verified funding")?;
         ensure!(
             !coin.history.is_empty(),
-            "activate the coin before transferring it"
+            "fund the coin before transferring it"
+        );
+        ensure!(
+            coin.funding
+                .as_ref()
+                .is_none_or(|funding| funding.stage == FundingStage::Broadcast),
+            "funding has not been broadcast"
         );
         ensure!(
             request.coin_id()? == coin.keys.coin_id,
@@ -874,19 +874,19 @@ async fn sign_transfer(
             capability,
             handoff,
             secret_xonly(&withdrawal_secret),
-            observation.tip_height,
+            observation.confirmations,
             &coin.history,
         )?;
-        let locktime = coin
+        let delay_blocks = coin
             .history
             .last()
             .expect("history checked non-empty")
-            .locktime
-            .checked_sub(LOCKTIME_STEP)
-            .context("recovery locktime cannot be decremented")?;
+            .delay_blocks
+            .checked_sub(DELAY_STEP)
+            .context("recovery delay cannot be decremented")?;
         require_reaction_margin(
-            observation.tip_height,
-            locktime,
+            observation.confirmations,
+            delay_blocks,
             config.min_reaction_blocks.max(request.min_reaction_blocks),
         )?;
         let (sign_request, prepared) = prepare_recovery(
@@ -897,26 +897,25 @@ async fn sign_transfer(
             handoff,
             request.next_capability_hash()?,
             request.withdrawal_key()?,
-            locktime,
-            observation.tip_height,
+            delay_blocks,
+            observation.confirmations,
         )?;
         state.pending = Some(PendingOperation::Recovery(PendingRecovery {
             purpose: RecoveryPurpose::Transfer {
                 request: request.clone(),
             },
             stage: RecoveryStage::Prepared {
-                current: Box::new(RecoveryAttempt {
+                attempt: Box::new(RecoveryAttempt {
                     expected_signature_count: status.signature_count,
-                    locktime,
+                    delay_blocks,
                     request: sign_request,
                     prepared: Box::new(prepared),
                 }),
-                superseded: Vec::new(),
             },
         }));
         store.save(&state)?;
         test_failpoint("after_prepare")?;
-        let outcome = finish_pending_recovery(&store, &mut state, &enclave, &config).await?;
+        let outcome = finish_pending_recovery(&store, &mut state, Some(&enclave), &config).await?;
         let RecoveryOutcome::Transferred(envelope) = outcome else {
             bail!("pending operation was not a transfer");
         };
@@ -924,7 +923,7 @@ async fn sign_transfer(
         return emit_transfer_sent(json_output, &request, &envelope, output_path, false);
     }
     let enclave = connect_verified(&config).await?;
-    let outcome = finish_pending_recovery(&store, &mut state, &enclave, &config).await?;
+    let outcome = finish_pending_recovery(&store, &mut state, Some(&enclave), &config).await?;
     let RecoveryOutcome::Transferred(envelope) = outcome else {
         bail!("pending operation was not a transfer");
     };
@@ -1039,7 +1038,7 @@ async fn accept_transfer(
                 "coin_id": request.coin_id,
                 "expected_amount_sat": request.expected_amount_sat,
                 "signature_count": coin.history.len(),
-                "latest_locktime": coin.history.last().map(|recovery| recovery.locktime),
+                "latest_delay_blocks": coin.history.last().map(|recovery| recovery.delay_blocks),
             }),
             format!("Transfer {} was already accepted", request.request_id),
         );
@@ -1076,7 +1075,7 @@ async fn accept_transfer(
         .history
         .last()
         .context("transfer has no recovery history")?;
-    let latest_locktime = latest.locktime;
+    let latest_delay_blocks = latest.delay_blocks;
     ensure!(
         latest.withdrawal_xonly_pubkey == request.withdrawal_key()?,
         "latest recovery does not pay the receiver"
@@ -1101,18 +1100,19 @@ async fn accept_transfer(
             &SecretKey::from_slice(&incoming.withdrawal_secret)
                 .context("saved withdrawal key is invalid")?,
         ),
-        observation.tip_height,
+        observation.confirmations,
         &payload.history,
     )?;
     require_reaction_margin(
-        observation.tip_height,
-        latest_locktime,
+        observation.confirmations,
+        latest_delay_blocks,
         config.min_reaction_blocks.max(request.min_reaction_blocks),
     )?;
     state.coin = Some(WalletCoin {
         client_secret: payload.client_secret,
         keys: payload.metadata.keys.clone(),
         metadata: Some(payload.metadata),
+        funding: None,
         current_capability: Some(incoming.capability),
         current_handoff: Some(payload.current_handoff),
         withdrawal_secret: Some(incoming.withdrawal_secret),
@@ -1131,7 +1131,7 @@ async fn accept_transfer(
             "coin_id": request.coin_id,
             "expected_amount_sat": request.expected_amount_sat,
             "signature_count": status.signature_count,
-            "latest_locktime": latest_locktime,
+            "latest_delay_blocks": latest_delay_blocks,
             "tip_height": observation.tip_height,
             "confirmations": observation.confirmations,
         }),
@@ -1173,11 +1173,25 @@ async fn coin_status(
     let mut history_current = status.signature_count == coin.history.len() as u64;
     if let Some(metadata) = &coin.metadata {
         let chain = Chain::connect(&config.chain, config.network).await?;
-        let observation = chain
-            .verify_funding(metadata, config.min_confirmations)
-            .await?;
-        confirmations = Some(observation.confirmations);
-        tip_height = Some(observation.tip_height);
+        let funding_stage = coin.funding.as_ref().map(|funding| funding.stage);
+        if matches!(
+            funding_stage,
+            Some(FundingStage::Prepared | FundingStage::RecoverySecured)
+        ) {
+            confirmations = Some(0);
+            tip_height = Some(chain.tip_height().await?);
+        } else {
+            let minimum_confirmations = if funding_stage == Some(FundingStage::Broadcast) {
+                0
+            } else {
+                config.min_confirmations
+            };
+            let observation = chain
+                .verify_funding(metadata, minimum_confirmations)
+                .await?;
+            confirmations = Some(observation.confirmations);
+            tip_height = Some(observation.tip_height);
+        }
         if let (Some(capability), Some(latest)) = (coin.current_capability, coin.history.last()) {
             let handoff = coin
                 .current_handoff
@@ -1199,8 +1213,8 @@ async fn coin_status(
             )?;
             reaction_safe = Some(
                 require_reaction_margin(
-                    observation.tip_height,
-                    latest.locktime,
+                    confirmations.unwrap_or_default(),
+                    latest.delay_blocks,
                     config.min_reaction_blocks,
                 )
                 .is_ok(),
@@ -1221,16 +1235,25 @@ async fn coin_status(
             );
         }
     }
+    let lifecycle = if coin.current_capability.is_some()
+        && coin.funding.as_ref().map(|funding| funding.stage) == Some(FundingStage::Broadcast)
+        && confirmations.is_some_and(|count| count >= config.min_confirmations)
+    {
+        "owned"
+    } else {
+        coin.lifecycle()
+    };
     emit(
         json_output,
         json!({
             "status": "ok",
-            "lifecycle": coin.lifecycle(),
+            "lifecycle": lifecycle,
             "coin_id": hex::encode(coin.keys.coin_id),
             "signature_count": status.signature_count,
             "local_history_count": coin.history.len(),
             "history_current": history_current,
-            "latest_locktime": coin.history.last().map(|recovery| recovery.locktime),
+            "latest_delay_blocks": coin.history.last().map(|recovery| recovery.delay_blocks),
+            "funding_stage": coin.funding.as_ref().map(|funding| funding.stage),
             "tip_height": tip_height,
             "confirmations": confirmations,
             "reaction_safe": reaction_safe,
@@ -1239,7 +1262,7 @@ async fn coin_status(
         format!(
             "Coin {} is {} with {} enclave signatures{}",
             hex::encode(coin.keys.coin_id),
-            coin.lifecycle(),
+            lifecycle,
             status.signature_count,
             if history_current {
                 ""
@@ -1290,13 +1313,13 @@ async fn export_recovery(
         json!({
             "status": "recovery_exported",
             "output": output_path,
-            "locktime": recovery.locktime,
+            "delay_blocks": recovery.delay_blocks,
             "history_index": recovery_index,
             "txid": recovery.transaction.compute_txid().to_string(),
         }),
         format!(
-            "Exported recovery transaction with locktime {} to {}",
-            recovery.locktime,
+            "Exported recovery transaction with a {}-block delay to {}",
+            recovery.delay_blocks,
             output_path.display()
         ),
     )
@@ -1309,6 +1332,7 @@ async fn exit_coin(
     destination: &str,
     fee_rate: Option<u64>,
     max_fee_sat: u64,
+    dry_run: bool,
 ) -> Result<()> {
     let (store, config) = open_wallet(directory, password_file)?;
     let state = store.load()?;
@@ -1335,16 +1359,23 @@ async fn exit_coin(
         "saved withdrawal key does not match owned recovery"
     );
     verify_recovery(metadata, recovery)?;
+    ensure!(
+        coin.funding
+            .as_ref()
+            .is_none_or(|funding| funding.stage == FundingStage::Broadcast),
+        "funding has not been broadcast"
+    );
     let destination = Address::from_str(destination)
         .context("invalid destination address")?
         .require_network(config.network.bitcoin_network())
         .context("destination address is for the wrong network")?;
     let chain = Chain::connect(&config.chain, config.network).await?;
-    let tip_height = chain.tip_height().await?;
+    let observation = chain.verify_funding(metadata, 1).await?;
     ensure!(
-        tip_height >= recovery.locktime,
-        "recovery is not final until block height {} (current tip is {tip_height})",
-        recovery.locktime
+        observation.confirmations >= recovery.delay_blocks,
+        "recovery is not final until funding has {} confirmations (currently {})",
+        recovery.delay_blocks,
+        observation.confirmations
     );
     let fee_rate = match fee_rate {
         Some(rate) => rate,
@@ -1365,12 +1396,28 @@ async fn exit_coin(
         fee_sat <= max_fee_sat,
         "exit fee {fee_sat} sat exceeds maximum {max_fee_sat} sat"
     );
-    chain
-        .submit_package(
-            &serialize_hex(&recovery.transaction),
-            &serialize_hex(&child),
-        )
-        .await?;
+    let parent_hex = serialize_hex(&recovery.transaction);
+    let child_hex = serialize_hex(&child);
+    if dry_run {
+        return emit(
+            json_output,
+            json!({
+                "status": "package_prepared",
+                "coin_id": hex::encode(coin.keys.coin_id),
+                "recovery_txid": parent_txid.to_string(),
+                "exit_txid": child_txid.to_string(),
+                "destination": destination.to_string(),
+                "fee_rate_sat_vb": fee_rate,
+                "fee_sat": fee_sat,
+                "parent_hex": parent_hex,
+                "child_hex": child_hex,
+            }),
+            format!(
+                "Prepared recovery {parent_txid} and fee-paying child {child_txid} without broadcasting"
+            ),
+        );
+    }
+    chain.submit_package(&parent_hex, &child_hex).await?;
     emit(
         json_output,
         json!({
@@ -1414,7 +1461,7 @@ async fn export_receipt(
         metadata,
         &status,
         &coin.history,
-        observation.tip_height,
+        observation.confirmations,
         config.min_reaction_blocks,
     )?;
     let receipt = Receipt {
@@ -1477,7 +1524,7 @@ async fn verify_receipt(
         &receipt.metadata,
         &status,
         &receipt.history,
-        observation.tip_height,
+        observation.confirmations,
         config.min_reaction_blocks,
     )?;
     emit(
@@ -1497,14 +1544,14 @@ async fn verify_receipt(
 }
 
 enum RecoveryOutcome {
-    Activated,
+    FundingSecured,
     Transferred(TransferEnvelope),
 }
 
 async fn finish_pending_recovery(
     store: &WalletStore,
     state: &mut WalletState,
-    enclave: &EnclaveConnection,
+    enclave: Option<&EnclaveConnection>,
     config: &Config,
 ) -> Result<RecoveryOutcome> {
     loop {
@@ -1513,10 +1560,9 @@ async fn finish_pending_recovery(
             bail!("wallet does not have a pending signing operation");
         };
         match stage {
-            RecoveryStage::Prepared {
-                current,
-                superseded,
-            } => {
+            RecoveryStage::Prepared { attempt } => {
+                let enclave = enclave.context("pending signing requires the enclave")?;
+                let attempt = *attempt;
                 let coin = state
                     .coin
                     .as_ref()
@@ -1533,70 +1579,43 @@ async fn finish_pending_recovery(
                 }
                 let status = enclave.status(coin.keys.coin_id).await?;
                 verify_status(&coin.keys, &status)?;
-                ensure!(
-                    superseded.iter().all(|attempt| {
-                        attempt.expected_signature_count == current.expected_signature_count
-                            && attempt.request.coin_id == current.request.coin_id
-                            && attempt.request.current_capability
-                                == current.request.current_capability
-                            && attempt.request.current_handoff == current.request.current_handoff
-                    }),
-                    "superseded signing journal is inconsistent"
-                );
-                #[cfg(debug_assertions)]
-                if std::env::var("ENCLAVIA_WALLET_TEST_FAILPOINT").as_deref()
-                    == Ok("commit_superseded")
-                {
-                    let old = superseded
-                        .first()
-                        .context("test requires a superseded signing attempt")?;
-                    ensure!(
-                        attempt_uncommitted(&status, &current),
-                        "test requires an uncommitted current attempt"
-                    );
-                    enclave.sign(&old.request).await?;
-                    bail!("stopped at test failpoint commit_superseded");
-                }
-                let committed = attempt_committed(&status, &current)?;
+                let committed = attempt_committed(&status, &attempt)?;
                 if !committed {
                     ensure!(
-                        attempt_uncommitted(&status, &current),
+                        attempt_uncommitted(&status, &attempt),
                         "pending signing journal does not match live enclave state"
                     );
                     let chain = Chain::connect(&config.chain, config.network).await?;
-                    let observation = chain
-                        .verify_funding(metadata, config.min_confirmations)
-                        .await?;
-                    let reaction_blocks = match &purpose {
-                        RecoveryPurpose::Activate { .. } => config.min_reaction_blocks,
+                    let (funding_confirmations, reaction_blocks) = match &purpose {
+                        RecoveryPurpose::Fund { .. } => {
+                            let funding = coin
+                                .funding
+                                .as_ref()
+                                .context("pending funding journal is missing")?;
+                            ensure!(
+                                funding.stage == FundingStage::Prepared,
+                                "funding recovery was already secured"
+                            );
+                            chain.validate_prepared_funding(metadata, &funding.transaction)?;
+                            (0, config.min_reaction_blocks)
+                        }
                         RecoveryPurpose::Transfer { request } => {
-                            config.min_reaction_blocks.max(request.min_reaction_blocks)
+                            let observation = chain
+                                .verify_funding(metadata, config.min_confirmations)
+                                .await?;
+                            (
+                                observation.confirmations,
+                                config.min_reaction_blocks.max(request.min_reaction_blocks),
+                            )
                         }
                     };
                     require_reaction_margin(
-                        observation.tip_height,
-                        current.locktime,
+                        funding_confirmations,
+                        attempt.delay_blocks,
                         reaction_blocks,
                     )?;
                 }
-                let (attempt, response) = if committed {
-                    let mut candidates = Vec::with_capacity(1 + superseded.len());
-                    candidates.push(*current);
-                    candidates.extend(superseded);
-                    let mut winner = None;
-                    for attempt in candidates {
-                        if let Ok(response) = enclave.sign(&attempt.request).await {
-                            winner = Some((attempt, response));
-                            break;
-                        }
-                    }
-                    winner
-                        .context("none of the journaled requests matches the enclave retry cache")?
-                } else {
-                    let attempt = *current;
-                    let response = enclave.sign(&attempt.request).await?;
-                    (attempt, response)
-                };
+                let response = enclave.sign(&attempt.request).await?;
                 test_failpoint("after_sign")?;
                 state.pending = Some(PendingOperation::Recovery(PendingRecovery {
                     purpose,
@@ -1611,7 +1630,7 @@ async fn finish_pending_recovery(
             RecoveryStage::Responded { attempt, response } => {
                 let RecoveryAttempt {
                     expected_signature_count,
-                    locktime,
+                    delay_blocks,
                     request,
                     prepared,
                 } = *attempt;
@@ -1619,14 +1638,22 @@ async fn finish_pending_recovery(
                     .coin
                     .as_ref()
                     .context("pending signing coin is missing")?;
-                let status = enclave.status(coin.keys.coin_id).await?;
-                verify_status(&coin.keys, &status)?;
-                verify_sign_response(&request, expected_signature_count, &status, &response)?;
+                if matches!(&purpose, RecoveryPurpose::Transfer { .. }) {
+                    let enclave = enclave.context("pending transfer requires the enclave")?;
+                    let status = enclave.status(coin.keys.coin_id).await?;
+                    verify_status(&coin.keys, &status)?;
+                    verify_sign_response(&request, expected_signature_count, &status, &response)?;
+                } else {
+                    ensure!(
+                        expected_signature_count == 0,
+                        "initial funding recovery has an invalid signature count"
+                    );
+                }
                 let recovery =
                     complete_recovery(&request, &response, *prepared, coin.client_secret)?;
                 ensure!(
-                    recovery.locktime == locktime,
-                    "pending signing locktime is inconsistent"
+                    recovery.delay_blocks == delay_blocks,
+                    "pending signing delay is inconsistent"
                 );
                 let coin = state
                     .coin
@@ -1634,15 +1661,24 @@ async fn finish_pending_recovery(
                     .context("pending signing coin is missing")?;
                 coin.history.push(recovery);
                 let outcome = match purpose {
-                    RecoveryPurpose::Activate {
+                    RecoveryPurpose::Fund {
                         next_capability,
                         withdrawal_secret,
                     } => {
+                        let funding = coin
+                            .funding
+                            .as_mut()
+                            .context("pending funding journal is missing")?;
+                        ensure!(
+                            funding.stage == FundingStage::Prepared,
+                            "funding recovery was already secured"
+                        );
+                        funding.stage = FundingStage::RecoverySecured;
                         coin.current_capability = Some(next_capability);
                         coin.current_handoff = Some(response.next_handoff);
                         coin.withdrawal_secret = Some(withdrawal_secret);
                         coin.withdrawal_recovery_index = Some(coin.history.len() - 1);
-                        RecoveryOutcome::Activated
+                        RecoveryOutcome::FundingSecured
                     }
                     RecoveryPurpose::Transfer { request } => {
                         let request_id = request.id()?;
@@ -1670,6 +1706,9 @@ async fn finish_pending_recovery(
                 };
                 state.pending = None;
                 store.save(state)?;
+                if matches!(&outcome, RecoveryOutcome::FundingSecured) {
+                    test_failpoint("after_recovery_secured")?;
+                }
                 return Ok(outcome);
             }
         }
@@ -1695,6 +1734,10 @@ fn attempt_committed(status: &CoinStatus, attempt: &RecoveryAttempt) -> Result<b
 }
 
 async fn connect_verified(config: &Config) -> Result<EnclaveConnection> {
+    #[cfg(debug_assertions)]
+    if std::env::var("ENCLAVIA_WALLET_TEST_DISABLE_ENCLAVE").as_deref() == Ok("1") {
+        bail!("enclave connection disabled by test");
+    }
     ensure!(
         config.network != NetworkId::Mainnet,
         "mainnet is not supported by this wallet"
@@ -1744,24 +1787,42 @@ fn emit_registration(
     )
 }
 
-fn emit_activation(json_output: bool, coin: &WalletCoin, existing: bool) -> Result<()> {
+fn emit_funding(json_output: bool, coin: &WalletCoin, existing: bool) -> Result<()> {
+    let metadata = coin
+        .metadata
+        .as_ref()
+        .context("funded coin has no metadata")?;
+    let funding = coin
+        .funding
+        .as_ref()
+        .context("funded coin has no funding journal")?;
     let recovery = coin
         .history
-        .last()
-        .context("activated coin has no recovery")?;
+        .first()
+        .context("funded coin has no recovery")?;
+    ensure!(
+        funding.stage == FundingStage::Broadcast,
+        "funding has not been broadcast"
+    );
     emit(
         json_output,
         json!({
-            "status": if existing { "already_active" } else { "activated" },
+            "status": if existing { "already_funded" } else { "funding_broadcast" },
             "coin_id": hex::encode(coin.keys.coin_id),
+            "outpoint": metadata.outpoint.to_string(),
+            "amount_sat": metadata.amount_sat,
+            "funding_txid": funding.transaction.compute_txid().to_string(),
+            "funding_fee_sat": funding.fee_sat,
+            "funding_fee_rate_sat_vb": funding.fee_rate_sat_vb,
             "signature_count": coin.history.len(),
-            "locktime": recovery.locktime,
+            "delay_blocks": recovery.delay_blocks,
+            "recovery_secured": true,
             "recovery_txid": recovery.transaction.compute_txid().to_string(),
         }),
         format!(
-            "Activated coin {} with recovery locktime {}",
+            "Secured recovery and broadcast funding for coin {} with a {}-block delay",
             hex::encode(coin.keys.coin_id),
-            recovery.locktime
+            recovery.delay_blocks
         ),
     )
 }
@@ -1796,9 +1857,9 @@ fn pending_name(pending: Option<&PendingOperation>) -> Option<&'static str> {
     pending.map(|pending| match pending {
         PendingOperation::Registration { .. } => "registration",
         PendingOperation::Recovery(PendingRecovery {
-            purpose: RecoveryPurpose::Activate { .. },
+            purpose: RecoveryPurpose::Fund { .. },
             ..
-        }) => "activation",
+        }) => "funding",
         PendingOperation::Recovery(PendingRecovery {
             purpose: RecoveryPurpose::Transfer { .. },
             ..

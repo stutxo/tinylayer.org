@@ -22,8 +22,9 @@ Trust assumptions:
 
 - The measured enclave, its dependencies, Nitro isolation, and randomness work
   correctly.
-- The enclave stays alive until the owner has a valid recovery. Restarting it
-  loses all signer state.
+- The enclave stays alive through every requested ownership transition.
+  Restarting it loses all signer state; the wallet secures Alice's recovery
+  before broadcasting funding.
 - The wallet verifies every Bitcoin transaction and recovery against an honest
   chain view.
 - Transfer requests move over an authenticated channel.

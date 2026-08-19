@@ -21,7 +21,7 @@ use crate::model::{Config, FILE_FORMAT_VERSION, WalletState};
 const CONFIG_FILE: &str = "config.json";
 const STATE_FILE: &str = "wallet.enc";
 const LOCK_FILE: &str = ".lock";
-const STATE_AAD: &[u8] = b"tinylayer-wallet-state-v3";
+const STATE_AAD: &[u8] = b"tinylayer-wallet-state-v4";
 const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
 const KDF_MEMORY_KIB: u32 = 19_456;
 const KDF_ITERATIONS: u32 = 2;
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn encrypted_state_round_trips_and_rejects_wrong_password() {
-        assert_eq!(STATE_AAD, b"tinylayer-wallet-state-v3");
+        assert_eq!(STATE_AAD, b"tinylayer-wallet-state-v4");
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("alice");
         let config = Config {
@@ -509,6 +509,7 @@ mod tests {
             chain: ChainConfig::CoreRpc {
                 rpc_url: "http://127.0.0.1:18443".into(),
                 cookie_file: directory.join("cookie"),
+                wallet_name: "funder".into(),
             },
             min_confirmations: 1,
             min_reaction_blocks: 20,

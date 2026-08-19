@@ -76,13 +76,13 @@ same version.
 ### Bitcoin policy
 
 Transaction changes need positive and negative tests for exact versions,
-locktimes, sequences, prevouts, amounts, scripts, sighashes, witnesses, dust,
-fees, and mutation resistance. Keep Bitcoin validation in the untrusted client;
-the enclave intentionally signs an opaque digest.
+relative delays, sequences, prevouts, amounts, scripts, sighashes, witnesses,
+dust, fees, and mutation resistance. Keep Bitcoin validation in the untrusted
+client; the enclave intentionally signs an opaque digest.
 
 ### Wallet formats
 
-Wallet state and transfer artifacts currently use `FILE_FORMAT_VERSION = 3`.
+Wallet state and transfer artifacts currently use `FILE_FORMAT_VERSION = 4`.
 Many payload structs reject unknown fields, while some tagged journal variants
 do not; do not assume a new field is safely ignored everywhere. A serialized
 format change must either preserve exact compatibility or increment the format

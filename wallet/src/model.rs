@@ -2,7 +2,7 @@ use std::{path::PathBuf, str::FromStr as _};
 
 use anyhow::{Context as _, Result, ensure};
 use bitcoin::{
-    Amount, OutPoint,
+    Amount, OutPoint, Transaction,
     hashes::Hash as _,
     secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey, ecdh::SharedSecret},
 };
@@ -19,8 +19,8 @@ use tinylayer_client::{
 };
 use zeroize::Zeroizing;
 
-pub const FILE_FORMAT_VERSION: u32 = 3;
-const TRANSFER_INFO: &[u8] = b"Tinylayer/TransferPackage/v3";
+pub const FILE_FORMAT_VERSION: u32 = 4;
+const TRANSFER_INFO: &[u8] = b"Tinylayer/TransferPackage/v4";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +97,7 @@ pub enum ChainConfig {
     CoreRpc {
         rpc_url: String,
         cookie_file: PathBuf,
+        wallet_name: String,
     },
 }
 
@@ -135,6 +136,7 @@ pub struct WalletCoin {
     pub client_secret: SecretKey,
     pub keys: CoinKeys,
     pub metadata: Option<CoinMetadata>,
+    pub funding: Option<FundingJournal>,
     pub current_capability: Option<[u8; 32]>,
     pub current_handoff: Option<HandoffToken>,
     pub withdrawal_secret: Option<[u8; 32]>,
@@ -148,16 +150,37 @@ impl WalletCoin {
     pub fn lifecycle(&self) -> &'static str {
         if self.current_capability.is_none() {
             "transferred"
-        } else if self.history.is_empty() {
-            if self.metadata.is_some() {
-                "funded"
-            } else {
-                "registered"
+        } else if let Some(funding) = &self.funding {
+            match funding.stage {
+                FundingStage::Prepared => "funding_prepared",
+                FundingStage::RecoverySecured => "recovery_secured",
+                FundingStage::Broadcast => "funding_broadcast",
             }
+        } else if self.history.is_empty() {
+            "registered"
         } else {
             "owned"
         }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FundingJournal {
+    pub transaction: Transaction,
+    pub delay_blocks: u32,
+    pub fee_rate_sat_vb: u64,
+    pub max_fee_sat: u64,
+    pub fee_sat: u64,
+    pub stage: FundingStage,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FundingStage {
+    Prepared,
+    RecoverySecured,
+    Broadcast,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -182,7 +205,7 @@ pub struct PendingRecovery {
 #[serde(deny_unknown_fields)]
 pub struct RecoveryAttempt {
     pub expected_signature_count: u64,
-    pub locktime: u32,
+    pub delay_blocks: u32,
     pub request: SignRequest,
     pub prepared: Box<PreparedRecovery>,
 }
@@ -190,7 +213,7 @@ pub struct RecoveryAttempt {
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "purpose")]
 pub enum RecoveryPurpose {
-    Activate {
+    Fund {
         next_capability: [u8; 32],
         withdrawal_secret: [u8; 32],
     },
@@ -203,8 +226,7 @@ pub enum RecoveryPurpose {
 #[serde(rename_all = "snake_case", tag = "stage")]
 pub enum RecoveryStage {
     Prepared {
-        current: Box<RecoveryAttempt>,
-        superseded: Vec<RecoveryAttempt>,
+        attempt: Box<RecoveryAttempt>,
     },
     Responded {
         attempt: Box<RecoveryAttempt>,
@@ -520,9 +542,9 @@ mod tests {
 
     #[test]
     fn transfer_package_is_encrypted_and_bound_to_request() {
-        assert_eq!(FILE_FORMAT_VERSION, 3);
+        assert_eq!(FILE_FORMAT_VERSION, 4);
         assert_eq!(tinylayer_client::PROTOCOL_VERSION, 1);
-        assert_eq!(TRANSFER_INFO, b"Tinylayer/TransferPackage/v3");
+        assert_eq!(TRANSFER_INFO, b"Tinylayer/TransferPackage/v4");
         let transport = random_secret_key();
         let transport_public = PublicKey::from_secret_key(&Secp256k1::new(), &transport);
         let request = TransferRequest::new(

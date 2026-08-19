@@ -25,8 +25,7 @@ pub use tinylayer_enclave::{
 };
 use tinylayer_enclave::{Request, Response};
 
-pub const LOCKTIME_STEP: u32 = 10;
-const RECOVERY_SEQUENCE: Sequence = Sequence::ENABLE_RBF_NO_LOCKTIME;
+pub const DELAY_STEP: u32 = 10;
 /// BIP431 TRUC (v3): recovery parents carry zero fee and are fee-bumped at
 /// broadcast time by a child paying for the whole package.
 pub const TRUC_VERSION: Version = Version(3);
@@ -118,7 +117,7 @@ pub struct CoinMetadata {
 pub struct SignedRecovery {
     pub transaction: Transaction,
     pub withdrawal_xonly_pubkey: XOnlyPublicKey,
-    pub locktime: u32,
+    pub delay_blocks: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -128,7 +127,7 @@ pub struct PreparedRecovery {
     metadata: CoinMetadata,
     transaction: Transaction,
     withdrawal_xonly_pubkey: XOnlyPublicKey,
-    locktime: u32,
+    delay_blocks: u32,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -149,8 +148,8 @@ pub enum Error {
     InvalidClientSignature,
     #[error("funding UTXO does not match coin metadata")]
     FundingMismatch,
-    #[error("recovery locktime does not leave a safe future reaction window")]
-    UnsafeLocktime,
+    #[error("recovery delay does not leave a safe reaction window")]
+    UnsafeDelay,
     #[error("recovery transaction is not canonical")]
     TransactionMismatch,
     #[error("signed recovery has a non-canonical witness")]
@@ -163,8 +162,8 @@ pub enum Error {
     AmountTooLarge,
     #[error("recovery output would be dust")]
     DustOutput,
-    #[error("locktime is not a valid absolute block height")]
-    InvalidLocktime,
+    #[error("recovery delay is not a valid BIP68 block delay")]
+    InvalidDelay,
     #[error("failed to compute Taproot sighash")]
     Sighash,
     #[error("withdrawal key does not match the recovery output")]
@@ -377,8 +376,8 @@ pub fn prepare_recovery(
     current_handoff: HandoffToken,
     next_capability_hash: [u8; 32],
     withdrawal_xonly_pubkey: XOnlyPublicKey,
-    locktime: u32,
-    tip_height: u32,
+    delay_blocks: u32,
+    funding_confirmations: u32,
 ) -> Result<(SignRequest, PreparedRecovery), Error> {
     metadata.validate()?;
     verify_status(&metadata.keys, status)?;
@@ -395,7 +394,7 @@ pub fn prepare_recovery(
     if next_capability_hash == current_capability_hash {
         return Err(Error::ResponseMismatch);
     }
-    require_future_locktime(tip_height, locktime)?;
+    require_future_delay(funding_confirmations, delay_blocks)?;
     if client_xonly(client_secret) != metadata.keys.client_pubkey {
         return Err(Error::WrongClientKey);
     }
@@ -403,7 +402,7 @@ pub fn prepare_recovery(
         metadata.outpoint,
         metadata.amount_sat,
         withdrawal_xonly_pubkey,
-        locktime,
+        delay_blocks,
     )?;
     let sighash = recovery_sighash(&transaction, metadata.amount_sat, &metadata.keys)?;
     let request = SignRequest {
@@ -420,7 +419,7 @@ pub fn prepare_recovery(
             metadata: metadata.clone(),
             transaction,
             withdrawal_xonly_pubkey,
-            locktime,
+            delay_blocks,
         },
     ))
 }
@@ -445,7 +444,7 @@ pub fn complete_recovery(
         prepared.metadata.outpoint,
         prepared.metadata.amount_sat,
         prepared.withdrawal_xonly_pubkey,
-        prepared.locktime,
+        prepared.delay_blocks,
     )?;
     if prepared.transaction != expected {
         return Err(Error::TransactionMismatch);
@@ -488,7 +487,7 @@ pub fn complete_recovery(
     Ok(SignedRecovery {
         transaction: prepared.transaction,
         withdrawal_xonly_pubkey: prepared.withdrawal_xonly_pubkey,
-        locktime: prepared.locktime,
+        delay_blocks: prepared.delay_blocks,
     })
 }
 
@@ -500,7 +499,7 @@ pub fn verify_history(
     current_capability: Capability,
     current_handoff: HandoffToken,
     expected_latest_withdrawal: XOnlyPublicKey,
-    tip_height: u32,
+    funding_confirmations: u32,
     history: &[SignedRecovery],
 ) -> Result<(), Error> {
     verify_status(&metadata.keys, status)?;
@@ -526,13 +525,17 @@ pub fn verify_history(
         verify_recovery(metadata, recovery)?;
     }
     for pair in history.windows(2) {
-        validate_reaction_window(tip_height, pair[0].locktime, pair[1].locktime)?;
+        validate_reaction_window(
+            funding_confirmations,
+            pair[0].delay_blocks,
+            pair[1].delay_blocks,
+        )?;
     }
     if history
         .last()
-        .is_none_or(|latest| latest.locktime <= tip_height)
+        .is_none_or(|latest| latest.delay_blocks <= funding_confirmations)
     {
-        return Err(Error::UnsafeLocktime);
+        return Err(Error::UnsafeDelay);
     }
     Ok(())
 }
@@ -543,7 +546,7 @@ pub fn verify_recovery(metadata: &CoinMetadata, recovery: &SignedRecovery) -> Re
         metadata.outpoint,
         metadata.amount_sat,
         recovery.withdrawal_xonly_pubkey,
-        recovery.locktime,
+        recovery.delay_blocks,
     )?;
     let mut unsigned = recovery.transaction.clone();
     if unsigned.input.len() != 1 {
@@ -633,7 +636,7 @@ pub fn canonical_recovery(
     outpoint: OutPoint,
     amount_sat: u64,
     withdrawal_key: XOnlyPublicKey,
-    locktime: u32,
+    delay_blocks: u32,
 ) -> Result<Transaction, Error> {
     if outpoint.is_null() {
         return Err(Error::InvalidOutpoint);
@@ -641,19 +644,21 @@ pub fn canonical_recovery(
     if amount_sat > Amount::MAX_MONEY.to_sat() {
         return Err(Error::AmountTooLarge);
     }
-    let lock_time =
-        absolute::LockTime::from_height(locktime).map_err(|_| Error::InvalidLocktime)?;
+    let delay = u16::try_from(delay_blocks).map_err(|_| Error::InvalidDelay)?;
+    if delay == 0 {
+        return Err(Error::InvalidDelay);
+    }
     let script_pubkey = ScriptBuf::new_p2tr(&Secp256k1::verification_only(), withdrawal_key, None);
     if Amount::from_sat(amount_sat) < script_pubkey.minimal_non_dust() {
         return Err(Error::DustOutput);
     }
     Ok(Transaction {
         version: TRUC_VERSION,
-        lock_time,
+        lock_time: absolute::LockTime::ZERO,
         input: vec![TxIn {
             previous_output: outpoint,
             script_sig: ScriptBuf::new(),
-            sequence: RECOVERY_SEQUENCE,
+            sequence: Sequence::from_height(delay),
             witness: Witness::new(),
         }],
         output: vec![TxOut {
@@ -666,7 +671,8 @@ pub fn canonical_recovery(
 /// Builds the fee-paying TRUC child that makes a zero-fee recovery parent
 /// confirmable. The child spends the entire recovery output to `destination`
 /// and pays the fee for the whole package, so the pair must be submitted
-/// together (`submitpackage`). The recovery locktime must already be final.
+/// together (`submitpackage`). The funding output must already have reached
+/// the recovery's BIP68 age.
 pub fn build_exit_child(
     recovery: &SignedRecovery,
     amount_sat: u64,
@@ -786,14 +792,14 @@ pub fn recovery_sighash(
 }
 
 pub fn validate_reaction_window(
-    tip_height: u32,
-    older_locktime: u32,
-    newer_locktime: u32,
+    funding_confirmations: u32,
+    older_delay_blocks: u32,
+    newer_delay_blocks: u32,
 ) -> Result<(), Error> {
-    if older_locktime.checked_sub(LOCKTIME_STEP) != Some(newer_locktime) {
+    if older_delay_blocks.checked_sub(DELAY_STEP) != Some(newer_delay_blocks) {
         return Err(Error::TransactionMismatch);
     }
-    require_future_locktime(tip_height, newer_locktime)
+    require_future_delay(funding_confirmations, newer_delay_blocks)
 }
 
 struct FundingMaterial {
@@ -838,9 +844,9 @@ fn verify_signature(
         .map_err(|_| error)
 }
 
-fn require_future_locktime(tip_height: u32, locktime: u32) -> Result<(), Error> {
-    if locktime <= tip_height {
-        return Err(Error::UnsafeLocktime);
+fn require_future_delay(funding_confirmations: u32, delay_blocks: u32) -> Result<(), Error> {
+    if delay_blocks <= funding_confirmations {
+        return Err(Error::UnsafeDelay);
     }
     Ok(())
 }

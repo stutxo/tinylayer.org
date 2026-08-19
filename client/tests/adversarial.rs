@@ -5,13 +5,15 @@ use bitcoin::{
     transaction::Version,
 };
 use tinylayer_client::{
-    CoinStatus, Error, INITIAL_HANDOFF, SignRequest, SignResponse, SignedRecovery, authorization,
-    capability_hash, complete_recovery, funding_script, prepare_recovery, verify_funding_utxo,
-    verify_history, verify_recovery, verify_sign_response, verify_signed_recovery,
+    CoinStatus, DELAY_STEP, Error, INITIAL_HANDOFF, SignRequest, SignResponse, SignedRecovery,
+    authorization, capability_hash, complete_recovery, funding_script, prepare_recovery,
+    verify_funding_utxo, verify_history, verify_recovery, verify_sign_response,
+    verify_signed_recovery,
 };
 
 use support::{
-    AMOUNT, CAP_0, CAP_A, CAP_B, LOCKTIME, initial_handoff, opened, outpoint, secret, sign, xonly,
+    AMOUNT, CAP_0, CAP_A, CAP_B, DELAY_BLOCKS, initial_handoff, opened, outpoint, secret, sign,
+    xonly,
 };
 
 fn signed() -> (support::Opened, SignedRecovery, [u8; 32]) {
@@ -24,7 +26,7 @@ fn signed() -> (support::Opened, SignedRecovery, [u8; 32]) {
         initial_handoff(),
         capability_hash(&CAP_A),
         xonly(3),
-        LOCKTIME,
+        DELAY_BLOCKS,
     );
     (opened, recovery, handoff)
 }
@@ -52,7 +54,7 @@ fn preparation_checks_secret_status_authorization_handoff_and_window() {
                    capability,
                    handoff,
                    next_capability_hash,
-                   tip_height| {
+                   funding_confirmations| {
         prepare_recovery(
             &opened.metadata,
             status,
@@ -61,8 +63,8 @@ fn preparation_checks_secret_status_authorization_handoff_and_window() {
             handoff,
             next_capability_hash,
             xonly(3),
-            LOCKTIME,
-            tip_height,
+            DELAY_BLOCKS,
+            funding_confirmations,
         )
     };
     assert_eq!(
@@ -120,10 +122,10 @@ fn preparation_checks_secret_status_authorization_handoff_and_window() {
             CAP_0,
             INITIAL_HANDOFF,
             capability_hash(&CAP_A),
-            LOCKTIME,
+            DELAY_BLOCKS,
         )
         .err(),
-        Some(Error::UnsafeLocktime)
+        Some(Error::UnsafeDelay)
     );
     let mut wrong_key = status;
     wrong_key.signing_pubkey = xonly(9);
@@ -153,7 +155,7 @@ fn sign_response_verification_binds_count_authorization_handoff_and_signature() 
         INITIAL_HANDOFF,
         capability_hash(&CAP_A),
         xonly(3),
-        LOCKTIME,
+        DELAY_BLOCKS,
         0,
     )
     .unwrap();
@@ -223,7 +225,7 @@ fn completion_revalidates_request_secret_transaction_and_pinned_enclave_key() {
             INITIAL_HANDOFF,
             capability_hash(&CAP_A),
             xonly(3),
-            LOCKTIME,
+            DELAY_BLOCKS,
             0,
         )
         .unwrap();
@@ -245,7 +247,7 @@ fn completion_revalidates_request_secret_transaction_and_pinned_enclave_key() {
         INITIAL_HANDOFF,
         capability_hash(&CAP_A),
         xonly(3),
-        LOCKTIME,
+        DELAY_BLOCKS,
         0,
     )
     .unwrap();
@@ -267,7 +269,7 @@ fn completion_revalidates_request_secret_transaction_and_pinned_enclave_key() {
         INITIAL_HANDOFF,
         capability_hash(&CAP_A),
         xonly(3),
-        LOCKTIME,
+        DELAY_BLOCKS,
         0,
     )
     .unwrap();
@@ -406,18 +408,27 @@ fn recovery_rejects_swapped_duplicated_and_corrupt_signatures() {
 #[test]
 fn recovery_verification_rejects_every_canonical_transaction_mutation() {
     type Mutate = fn(&mut SignedRecovery);
-    let mutations: [Mutate; 11] = [
+    let mutations: [Mutate; 14] = [
         |recovery| recovery.transaction.version = Version::ONE,
-        |recovery| recovery.transaction.lock_time = absolute::LockTime::ZERO,
+        |recovery| recovery.transaction.lock_time = absolute::LockTime::from_height(1).unwrap(),
         |recovery| recovery.transaction.input[0].previous_output.vout ^= 1,
         |recovery| recovery.transaction.input[0].script_sig = ScriptBuf::from_bytes(vec![1]),
         |recovery| recovery.transaction.input[0].sequence = Sequence::MAX,
+        |recovery| {
+            recovery.transaction.input[0].sequence =
+                Sequence::from_512_second_intervals(DELAY_BLOCKS as u16)
+        },
+        |recovery| {
+            recovery.transaction.input[0].sequence =
+                Sequence::from_consensus(DELAY_BLOCKS | (1 << 16))
+        },
         |recovery| recovery.transaction.input.push(TxIn::default()),
         |recovery| recovery.transaction.input.clear(),
         |recovery| recovery.transaction.output[0].value = Amount::from_sat(1),
         |recovery| recovery.transaction.output[0].script_pubkey = ScriptBuf::new(),
         |recovery| recovery.transaction.output.push(TxOut::NULL),
         |recovery| recovery.withdrawal_xonly_pubkey = xonly(9),
+        |recovery| recovery.delay_blocks += 1,
     ];
     for mutate in mutations {
         let (opened, mut recovery, _) = signed();
@@ -493,7 +504,7 @@ fn two_recoveries() -> (support::Opened, Vec<SignedRecovery>, [u8; 32]) {
         INITIAL_HANDOFF,
         capability_hash(&CAP_A),
         xonly(3),
-        LOCKTIME,
+        DELAY_BLOCKS,
     );
     let (bob, handoff_b) = sign(
         &mut opened.enclave,
@@ -503,7 +514,7 @@ fn two_recoveries() -> (support::Opened, Vec<SignedRecovery>, [u8; 32]) {
         handoff_a,
         capability_hash(&CAP_B),
         xonly(4),
-        LOCKTIME - tinylayer_client::LOCKTIME_STEP,
+        DELAY_BLOCKS - DELAY_STEP,
     );
     (opened, vec![alice, bob], handoff_b)
 }
@@ -629,10 +640,10 @@ fn history_rejects_missing_extra_reordered_bad_reaction_and_expired_entries() {
             CAP_B,
             handoff,
             xonly(4),
-            LOCKTIME - tinylayer_client::LOCKTIME_STEP,
+            DELAY_BLOCKS - DELAY_STEP,
             &history,
         ),
-        Err(Error::UnsafeLocktime)
+        Err(Error::UnsafeDelay)
     );
 
     let mut wrong_step_opened = support::opened();
@@ -644,7 +655,7 @@ fn history_rejects_missing_extra_reordered_bad_reaction_and_expired_entries() {
         INITIAL_HANDOFF,
         capability_hash(&CAP_A),
         xonly(3),
-        LOCKTIME,
+        DELAY_BLOCKS,
     );
     let (wrong_step_bob, wrong_step_handoff_b) = sign(
         &mut wrong_step_opened.enclave,
@@ -654,7 +665,7 @@ fn history_rejects_missing_extra_reordered_bad_reaction_and_expired_entries() {
         wrong_step_handoff_a,
         capability_hash(&CAP_B),
         xonly(4),
-        LOCKTIME - tinylayer_client::LOCKTIME_STEP - 1,
+        DELAY_BLOCKS - DELAY_STEP - 1,
     );
     let wrong_step_status = wrong_step_opened
         .enclave

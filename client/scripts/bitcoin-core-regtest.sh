@@ -63,6 +63,7 @@ initialize_wallet() {
     --unsafe-plaintext \
     --bitcoin-rpc-url "$RPC_URL" \
     --bitcoin-cookie-file "$COOKIE_FILE" \
+    --bitcoin-wallet "$WALLET_NAME" \
     --min-confirmations 1 >/dev/null
 }
 
@@ -82,18 +83,18 @@ wallet "$ALICE" enclave verify | jq -e '.client_protocol_version == 1' >/dev/nul
 
 registered=$(wallet "$ALICE" coin register)
 coin_id=$(jq -er '.coin_id' <<<"$registered")
-fund_address=$(jq -er '.funding_address' <<<"$registered")
-fund_script=$(jq -er '.funding_script_hex' <<<"$registered")
-fund_txid=$("${RPC[@]}" sendtoaddress "$fund_address" 0.001)
-fund_vout=$("${RPC[@]}" getrawtransaction "$fund_txid" true | \
-  jq -er --arg script "$fund_script" '.vout[] | select(.scriptPubKey.hex == $script) | .n')
+funded=$(wallet "$ALICE" coin fund --amount-sat 100000 \
+  --delay-blocks 100 --fee-rate 2 --max-fee-sat 10000)
+jq -e 'select(.status == "funding_broadcast" and .recovery_secured == true)' \
+  <<<"$funded" >/dev/null
+fund_txid=$(jq -er '.funding_txid' <<<"$funded")
+outpoint=$(jq -er '.outpoint' <<<"$funded")
+alice_delay=$(jq -er '.delay_blocks' <<<"$funded")
+"${RPC[@]}" getmempoolentry "$fund_txid" >/dev/null
+wallet "$ALICE" coin fund --amount-sat 100000 \
+  --delay-blocks 100 --fee-rate 2 --max-fee-sat 10000 | \
+  jq -e 'select(.status == "already_funded")' >/dev/null
 "${RPC[@]}" generatetoaddress 1 "$mine_address" >/dev/null
-outpoint="$fund_txid:$fund_vout"
-wallet "$ALICE" coin fund --outpoint "$outpoint" --amount-sat 100000 >/dev/null
-
-tip=$("${RPC[@]}" getblockcount)
-alice_locktime=$((tip + 50))
-wallet "$ALICE" coin activate --locktime "$alice_locktime" >/dev/null
 
 bob_request="$TEST_ROOT/bob-request.json"
 alice_to_bob="$TEST_ROOT/alice-to-bob.json"
@@ -109,7 +110,7 @@ wallet "$CAROL" transfer request --coin-id "$coin_id" --outpoint "$outpoint" \
   --amount-sat 100000 --output "$carol_request" >/dev/null
 wallet "$BOB" coin sign --request "$carol_request" --output "$bob_to_carol" >/dev/null
 accepted=$(wallet "$CAROL" transfer accept --request "$carol_request" --package "$bob_to_carol")
-carol_locktime=$(jq -er '.latest_locktime' <<<"$accepted")
+carol_delay=$(jq -er '.latest_delay_blocks' <<<"$accepted")
 
 receipt="$TEST_ROOT/receipt.json"
 wallet "$CAROL" receipt export --output "$receipt" >/dev/null
@@ -126,12 +127,41 @@ alice_tx=$(<"$alice_tx_file")
 bob_tx=$(<"$bob_tx_file")
 carol_tx=$(<"$carol_tx_file")
 
-"${RPC[@]}" generatetoaddress "$((carol_locktime - tip))" "$mine_address" >/dev/null
-printf 'Bob acceptance before its locktime: '
-"${RPC[@]}" testmempoolaccept "[\"$bob_tx\"]" | jq -e '.[0] | select(.allowed == false and .["reject-reason"] == "non-final") | {allowed, reject_reason: .["reject-reason"]}'
-printf 'Alice acceptance before its locktime: '
-"${RPC[@]}" testmempoolaccept "[\"$alice_tx\"]" | jq -e '.[0] | select(.allowed == false and .["reject-reason"] == "non-final") | {allowed, reject_reason: .["reject-reason"]}'
+confirmations=$("${RPC[@]}" gettransaction "$fund_txid" | jq -er '.confirmations')
+"${RPC[@]}" generatetoaddress "$((carol_delay - confirmations))" "$mine_address" >/dev/null
+printf 'Bob rejection before its relative delay: '
+"${RPC[@]}" testmempoolaccept "[\"$bob_tx\"]" | jq -e '.[0] | select(.allowed == false and .["reject-reason"] == "non-BIP68-final") | {allowed, reject_reason: .["reject-reason"]}'
+printf 'Alice rejection before its relative delay: '
+"${RPC[@]}" testmempoolaccept "[\"$alice_tx\"]" | jq -e '.[0] | select(.allowed == false and .["reject-reason"] == "non-BIP68-final") | {allowed, reject_reason: .["reject-reason"]}'
 exit_address=$("${RPC[@]}" getnewaddress)
+carol_package=$(wallet "$CAROL" coin exit --destination "$exit_address" \
+  --fee-rate 2 --max-fee-sat 10000 --dry-run)
+carol_parent=$(jq -er '.parent_hex' <<<"$carol_package")
+carol_child=$(jq -er '.child_hex' <<<"$carol_package")
+printf 'Carol maturity at %s confirmations: ' "$carol_delay"
+"${RPC[@]}" testmempoolaccept "[\"$carol_parent\",\"$carol_child\"]" | \
+  jq -e 'select(length == 2 and .[0].allowed == false and .[0]["reject-reason"] == "min relay fee not met" and .[1]["reject-reason"] == null) | map({txid, allowed, reject_reason: .["reject-reason"]})'
+
+"${RPC[@]}" generatetoaddress 10 "$mine_address" >/dev/null
+printf 'Alice rejection while Bob is valid: '
+"${RPC[@]}" testmempoolaccept "[\"$alice_tx\"]" | jq -e '.[0] | select(.allowed == false and .["reject-reason"] == "non-BIP68-final") | {allowed, reject_reason: .["reject-reason"]}'
+bob_package=$(wallet "$BOB" coin exit --destination "$exit_address" \
+  --fee-rate 2 --max-fee-sat 10000 --dry-run)
+bob_parent=$(jq -er '.parent_hex' <<<"$bob_package")
+bob_child=$(jq -er '.child_hex' <<<"$bob_package")
+printf 'Bob maturity at %s confirmations: ' "$((carol_delay + 10))"
+"${RPC[@]}" testmempoolaccept "[\"$bob_parent\",\"$bob_child\"]" | \
+  jq -e 'select(length == 2 and .[0].allowed == false and .[0]["reject-reason"] == "min relay fee not met" and .[1]["reject-reason"] == null) | map({txid, allowed, reject_reason: .["reject-reason"]})'
+
+"${RPC[@]}" generatetoaddress 10 "$mine_address" >/dev/null
+alice_package=$(wallet "$ALICE" coin exit --destination "$exit_address" \
+  --fee-rate 2 --max-fee-sat 10000 --dry-run)
+alice_parent=$(jq -er '.parent_hex' <<<"$alice_package")
+alice_child=$(jq -er '.child_hex' <<<"$alice_package")
+printf 'Alice maturity at %s confirmations: ' "$alice_delay"
+"${RPC[@]}" testmempoolaccept "[\"$alice_parent\",\"$alice_child\"]" | \
+  jq -e 'select(length == 2 and .[0].allowed == false and .[0]["reject-reason"] == "min relay fee not met" and .[1]["reject-reason"] == null) | map({txid, allowed, reject_reason: .["reject-reason"]})'
+
 submitted=$(wallet "$CAROL" coin exit --destination "$exit_address" --fee-rate 2 --max-fee-sat 10000)
 jq -e 'select(.status == "package_submitted")' <<<"$submitted" >/dev/null
 withdrawal_txid=$(jq -er '.exit_txid' <<<"$submitted")

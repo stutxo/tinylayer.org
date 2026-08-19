@@ -2,12 +2,12 @@ mod support;
 
 use bitcoin::secp256k1::{Message, Secp256k1, schnorr::Signature};
 use tinylayer_client::{
-    INITIAL_HANDOFF, LOCKTIME_STEP, authorization, capability_hash, complete_recovery,
+    DELAY_STEP, INITIAL_HANDOFF, authorization, capability_hash, complete_recovery,
     funding_control_block, funding_tapscript, prepare_recovery, recovery_sighash, verify_history,
     verify_recovery, verify_signed_recovery,
 };
 
-use support::{CAP_0, CAP_A, CAP_B, CAP_C, LOCKTIME, initial_handoff, opened, sign, xonly};
+use support::{CAP_0, CAP_A, CAP_B, CAP_C, DELAY_BLOCKS, initial_handoff, opened, sign, xonly};
 
 #[test]
 fn alice_bob_carol_transitions_preserve_bearer_key_and_history() {
@@ -20,7 +20,7 @@ fn alice_bob_carol_transitions_preserve_bearer_key_and_history() {
         initial_handoff(),
         capability_hash(&CAP_A),
         xonly(3),
-        LOCKTIME,
+        DELAY_BLOCKS,
     );
     let (bob, handoff_b) = sign(
         &mut opened.enclave,
@@ -30,7 +30,7 @@ fn alice_bob_carol_transitions_preserve_bearer_key_and_history() {
         handoff_a,
         capability_hash(&CAP_B),
         xonly(4),
-        LOCKTIME - LOCKTIME_STEP,
+        DELAY_BLOCKS - DELAY_STEP,
     );
     let carol_key = xonly(5);
     let (carol, handoff_c) = sign(
@@ -41,7 +41,7 @@ fn alice_bob_carol_transitions_preserve_bearer_key_and_history() {
         handoff_b,
         capability_hash(&CAP_C),
         carol_key,
-        LOCKTIME - 2 * LOCKTIME_STEP,
+        DELAY_BLOCKS - 2 * DELAY_STEP,
     );
     let history = [alice, bob, carol];
     let status = opened.enclave.status(opened.metadata.keys.coin_id).unwrap();
@@ -83,7 +83,7 @@ fn recovery_contains_both_ordinary_bip340_signatures_in_script_order() {
         INITIAL_HANDOFF,
         capability_hash(&CAP_A),
         xonly(3),
-        LOCKTIME,
+        DELAY_BLOCKS,
         0,
     )
     .unwrap();
@@ -146,7 +146,7 @@ fn exact_sign_retries_are_idempotent_and_complete_identically() {
         INITIAL_HANDOFF,
         capability_hash(&CAP_A),
         xonly(3),
-        LOCKTIME,
+        DELAY_BLOCKS,
         0,
     )
     .unwrap();

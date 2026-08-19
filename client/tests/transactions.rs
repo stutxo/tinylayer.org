@@ -10,13 +10,13 @@ use bitcoin::{
     transaction::Version,
 };
 use tinylayer_client::{
-    Error, LOCKTIME_STEP, NUMS_INTERNAL_KEY_BYTES, NetworkId, TRUC_VERSION, build_exit_child,
+    DELAY_STEP, Error, NUMS_INTERNAL_KEY_BYTES, NetworkId, TRUC_VERSION, build_exit_child,
     canonical_recovery, capability_hash, funding_address, funding_control_block, funding_script,
     funding_tapscript, recovery_sighash, validate_reaction_window,
 };
 
 use support::{
-    AMOUNT, CAP_0, CAP_A, LOCKTIME, initial_handoff, opened, outpoint, secret, sign, xonly,
+    AMOUNT, CAP_0, CAP_A, DELAY_BLOCKS, initial_handoff, opened, outpoint, secret, sign, xonly,
 };
 
 #[test]
@@ -88,7 +88,7 @@ fn funding_addresses_match_the_single_derived_output() {
 #[test]
 fn recovery_sighash_is_exact_bip342_default_script_spend() {
     let opened = opened();
-    let tx = canonical_recovery(outpoint(), AMOUNT, xonly(3), LOCKTIME).unwrap();
+    let tx = canonical_recovery(outpoint(), AMOUNT, xonly(3), DELAY_BLOCKS).unwrap();
     let leaf = funding_tapscript(&opened.metadata.keys);
     let leaf_hash = TapLeafHash::from_script(&leaf, LeafVersion::TapScript);
     let prevout = TxOut {
@@ -149,25 +149,29 @@ fn either_secret_key_parity_for_the_same_xonly_client_key_signs() {
         initial_handoff(),
         capability_hash(&CAP_A),
         xonly(9),
-        LOCKTIME,
+        DELAY_BLOCKS,
     );
     assert_eq!(recovery.transaction.input[0].witness.len(), 4);
 }
 
 #[test]
 fn canonical_recovery_has_all_exact_zero_fee_v3_fields() {
-    let tx = canonical_recovery(outpoint(), AMOUNT, xonly(3), LOCKTIME).unwrap();
+    let tx = canonical_recovery(outpoint(), AMOUNT, xonly(3), DELAY_BLOCKS).unwrap();
     assert_eq!(tx.version, TRUC_VERSION);
     assert_eq!(tx.version, Version(3));
-    assert_eq!(
-        tx.lock_time,
-        absolute::LockTime::from_height(LOCKTIME).unwrap()
-    );
+    assert_eq!(tx.lock_time, absolute::LockTime::ZERO);
     assert_eq!(tx.input.len(), 1);
     assert_eq!(tx.output.len(), 1);
     assert_eq!(tx.input[0].previous_output, outpoint());
     assert!(tx.input[0].script_sig.is_empty());
-    assert_eq!(tx.input[0].sequence, Sequence::ENABLE_RBF_NO_LOCKTIME);
+    assert_eq!(
+        tx.input[0].sequence,
+        Sequence::from_height(DELAY_BLOCKS as u16)
+    );
+    assert!(tx.input[0].sequence.is_relative_lock_time());
+    assert!(tx.input[0].sequence.is_height_locked());
+    assert!(!tx.input[0].sequence.is_time_locked());
+    assert!(tx.input[0].sequence.is_rbf());
     assert!(tx.input[0].witness.is_empty());
     assert_eq!(tx.output[0].value, Amount::from_sat(AMOUNT));
     assert_eq!(
@@ -177,9 +181,9 @@ fn canonical_recovery_has_all_exact_zero_fee_v3_fields() {
 }
 
 #[test]
-fn canonical_recovery_checks_outpoint_amount_dust_and_height() {
+fn canonical_recovery_checks_outpoint_amount_dust_and_delay() {
     assert_eq!(
-        canonical_recovery(bitcoin::OutPoint::null(), AMOUNT, xonly(3), LOCKTIME),
+        canonical_recovery(bitcoin::OutPoint::null(), AMOUNT, xonly(3), DELAY_BLOCKS),
         Err(Error::InvalidOutpoint)
     );
     assert_eq!(
@@ -187,36 +191,41 @@ fn canonical_recovery_checks_outpoint_amount_dust_and_height() {
             outpoint(),
             Amount::MAX_MONEY.to_sat() + 1,
             xonly(3),
-            LOCKTIME
+            DELAY_BLOCKS
         ),
         Err(Error::AmountTooLarge)
     );
     let script = ScriptBuf::new_p2tr(&Secp256k1::verification_only(), xonly(3), None);
     let dust = script.minimal_non_dust().to_sat();
     assert_eq!(
-        canonical_recovery(outpoint(), dust - 1, xonly(3), LOCKTIME),
+        canonical_recovery(outpoint(), dust - 1, xonly(3), DELAY_BLOCKS),
         Err(Error::DustOutput)
     );
-    assert!(canonical_recovery(outpoint(), dust, xonly(3), LOCKTIME).is_ok());
+    assert!(canonical_recovery(outpoint(), dust, xonly(3), DELAY_BLOCKS).is_ok());
     assert_eq!(
-        canonical_recovery(outpoint(), AMOUNT, xonly(3), 500_000_000),
-        Err(Error::InvalidLocktime)
+        canonical_recovery(outpoint(), AMOUNT, xonly(3), 0),
+        Err(Error::InvalidDelay)
     );
+    assert_eq!(
+        canonical_recovery(outpoint(), AMOUNT, xonly(3), u16::MAX as u32 + 1),
+        Err(Error::InvalidDelay)
+    );
+    assert!(canonical_recovery(outpoint(), AMOUNT, xonly(3), u16::MAX.into()).is_ok());
 }
 
 #[test]
-fn reaction_window_requires_exact_step_and_future_locktime() {
-    assert_eq!(validate_reaction_window(979, 990, 980), Ok(()));
+fn reaction_window_requires_exact_step_and_unexpired_delay() {
+    assert_eq!(validate_reaction_window(89, 100, 90), Ok(()));
     assert_eq!(
-        validate_reaction_window(980, 990, 980),
-        Err(Error::UnsafeLocktime)
+        validate_reaction_window(90, 100, 90),
+        Err(Error::UnsafeDelay)
     );
     assert_eq!(
-        validate_reaction_window(0, 990, 981),
+        validate_reaction_window(0, 100, 91),
         Err(Error::TransactionMismatch)
     );
     assert_eq!(
-        validate_reaction_window(0, LOCKTIME_STEP - 1, 0),
+        validate_reaction_window(0, DELAY_STEP - 1, 0),
         Err(Error::TransactionMismatch)
     );
 }
@@ -232,7 +241,7 @@ fn exit_child_pays_exact_package_fee_and_has_valid_tweaked_signature() {
         initial_handoff(),
         capability_hash(&CAP_A),
         xonly(9),
-        LOCKTIME,
+        DELAY_BLOCKS,
     );
     assert_eq!(recovery.transaction.input[0].witness.len(), 4);
     let destination = ScriptBuf::new_p2tr(&Secp256k1::verification_only(), xonly(3), None);
@@ -276,9 +285,9 @@ fn exit_child_pays_exact_package_fee_and_has_valid_tweaked_signature() {
 #[test]
 fn exit_child_rejects_wrong_key_amount_and_dust() {
     let recovery = tinylayer_client::SignedRecovery {
-        transaction: canonical_recovery(outpoint(), AMOUNT, xonly(9), LOCKTIME).unwrap(),
+        transaction: canonical_recovery(outpoint(), AMOUNT, xonly(9), DELAY_BLOCKS).unwrap(),
         withdrawal_xonly_pubkey: xonly(9),
-        locktime: LOCKTIME,
+        delay_blocks: DELAY_BLOCKS,
     };
     let destination = ScriptBuf::new_p2tr(&Secp256k1::verification_only(), xonly(3), None);
     assert_eq!(
@@ -292,9 +301,9 @@ fn exit_child_rejects_wrong_key_amount_and_dust() {
 
     let dust = destination.minimal_non_dust().to_sat();
     let dusty = tinylayer_client::SignedRecovery {
-        transaction: canonical_recovery(outpoint(), dust, xonly(9), LOCKTIME).unwrap(),
+        transaction: canonical_recovery(outpoint(), dust, xonly(9), DELAY_BLOCKS).unwrap(),
         withdrawal_xonly_pubkey: xonly(9),
-        locktime: LOCKTIME,
+        delay_blocks: DELAY_BLOCKS,
     };
     assert_eq!(
         build_exit_child(&dusty, dust, &secret(9), destination, 1),

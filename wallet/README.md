@@ -1,7 +1,7 @@
 # Tinylayer wallet
 
 `tinylayer-wallet` is the native command-line wallet and test harness for
-Tinylayer. It manages registration, funding verification, recovery
+Tinylayer. It manages registration, safe funding construction, recovery
 transactions, off-chain ownership transfers, receipts, and on-chain exits.
 
 The current wallet supports Regtest and Mutinynet. Mainnet is deliberately
@@ -11,7 +11,8 @@ must only be used with Regtest.
 ## Requirements
 
 - Rust 1.88 or newer.
-- Bitcoin Core 28 or newer with wallet support for the real Regtest flow.
+- Bitcoin Core 28 or newer with a loaded, private-key-enabled wallet for the
+  real Regtest flow.
 - `bitcoin-cli`, `curl`, and `jq`.
 - Free local ports 8080 for the workload and 18443 for Bitcoin Core RPC.
 - An Enclavia account, Docker, and the `enclavia` CLI for an attested
@@ -52,9 +53,9 @@ appear before the subcommand.
 ## Automated Regtest test
 
 The repository includes a real Bitcoin Core end-to-end test. It creates Alice,
-Bob, and Carol wallets; funds Alice; transfers Alice to Bob to Carol; verifies
-a receipt and the superseded recoveries; then exits Carol with a fee-paying
-child transaction.
+Bob, and Carol wallets; secures Alice's recovery before broadcasting funding;
+transfers Alice to Bob to Carol; verifies the 100/90/80-block BIP68 maturity
+order; then exits Carol with a fee-paying child transaction.
 
 Start a clean Regtest node in one terminal:
 
@@ -161,6 +162,7 @@ for DATA_DIR in "$ALICE" "$BOB"; do
     --unsafe-plaintext \
     --bitcoin-rpc-url http://127.0.0.1:18443 \
     --bitcoin-cookie-file "$COOKIE" \
+    --bitcoin-wallet funder \
     --min-confirmations 1
 done
 
@@ -177,32 +179,26 @@ REGISTERED=$("$WALLET" --data-dir "$ALICE" --json coin register)
 printf '%s\n' "$REGISTERED" | jq
 
 COIN_ID=$(jq -er '.coin_id' <<<"$REGISTERED")
-FUND_ADDRESS=$(jq -er '.funding_address' <<<"$REGISTERED")
-FUND_SCRIPT=$(jq -er '.funding_script_hex' <<<"$REGISTERED")
+FUNDED=$("$WALLET" --data-dir "$ALICE" --json coin fund \
+  --amount-sat 100000 \
+  --delay-blocks 100 \
+  --fee-rate 2 \
+  --max-fee-sat 10000)
+printf '%s\n' "$FUNDED" | jq
 
-FUND_TXID=$("${RPC[@]}" sendtoaddress "$FUND_ADDRESS" 0.001)
-FUND_VOUT=$(
-  "${RPC[@]}" getrawtransaction "$FUND_TXID" true |
-    jq -er --arg script "$FUND_SCRIPT" \
-      '.vout[] | select(.scriptPubKey.hex == $script) | .n'
-)
-OUTPOINT="$FUND_TXID:$FUND_VOUT"
-
+FUND_TXID=$(jq -er '.funding_txid' <<<"$FUNDED")
+OUTPOINT=$(jq -er '.outpoint' <<<"$FUNDED")
+"${RPC[@]}" getmempoolentry "$FUND_TXID" >/dev/null
 "${RPC[@]}" generatetoaddress 1 "$MINE_ADDRESS" >/dev/null
-
-"$WALLET" --data-dir "$ALICE" --json coin fund \
-  --outpoint "$OUTPOINT" \
-  --amount-sat 100000 | jq
-
-TIP=$("${RPC[@]}" getblockcount)
-ALICE_LOCKTIME=$((TIP + 50))
-
-"$WALLET" --data-dir "$ALICE" --json coin activate \
-  --locktime "$ALICE_LOCKTIME" | jq
 ```
 
-The locktime must leave enough blocks for every planned transfer. Each
-transfer reduces the latest recovery locktime by ten blocks.
+`coin fund` asks the configured Core wallet to create, sign, and finalize a
+non-RBF transaction without broadcasting it. The command derives the final
+txid and output, obtains and durably stores Alice's 100-block recovery, and only
+then broadcasts those exact funding bytes. A retry resumes the journaled stage
+instead of creating another transaction. Each transfer reduces the latest
+relative delay by ten blocks. The walkthrough uses 100 blocks to keep Regtest
+short; the command default is 2,016 and BIP68 permits at most 65,535.
 
 ### 5. Transfer Alice to Bob
 
@@ -250,11 +246,11 @@ complete signed recovery history, and reaction window.
 ### 7. Exit Bob on-chain
 
 ```bash
-BOB_LOCKTIME=$(jq -er '.latest_locktime' <<<"$ACCEPTED")
-TIP=$("${RPC[@]}" getblockcount)
+BOB_DELAY=$(jq -er '.latest_delay_blocks' <<<"$ACCEPTED")
+CONFIRMATIONS=$("${RPC[@]}" gettransaction "$FUND_TXID" | jq -er '.confirmations')
 
-if (( TIP < BOB_LOCKTIME )); then
-  "${RPC[@]}" generatetoaddress "$((BOB_LOCKTIME - TIP))" \
+if (( CONFIRMATIONS < BOB_DELAY )); then
+  "${RPC[@]}" generatetoaddress "$((BOB_DELAY - CONFIRMATIONS))" \
     "$MINE_ADDRESS" >/dev/null
 fi
 
@@ -272,7 +268,8 @@ EXIT_TXID=$(jq -er '.exit_txid' <<<"$EXITED")
 
 `coin exit` submits the zero-fee recovery parent together with a fee-paying v3
 child. `coin recovery --output <FILE>` only exports the raw parent transaction;
-it does not broadcast it.
+it does not broadcast it. Add `--dry-run` to `coin exit` to return both package
+transactions without submitting them.
 
 Clean up with:
 
@@ -287,32 +284,37 @@ Stop the workload with Ctrl-C in its terminal.
 
 Every owner receives a valid recovery transaction that spends the same funding
 output. Transferring the coin does not revoke or invalidate recoveries held by
-previous owners. Instead, each new recovery becomes final exactly ten blocks
-earlier than the preceding recovery:
+previous owners. Instead, each new recovery uses a relative delay exactly ten
+blocks shorter than the preceding recovery:
 
 ```text
-Alice recovery: initial locktime
-Bob recovery:   initial locktime - 10
-Carol recovery: initial locktime - 20
+Alice recovery: 100 blocks after funding confirms
+Bob recovery:    90 blocks after funding confirms
+Carol recovery:  80 blocks after funding confirms
 ```
 
 This ordering gives the current owner a window in which to settle before an
 older owner can use a superseded recovery. It requires an honest chain view and
 active monitoring outside this CLI.
 
+Recoveries use BIP68 block-based input sequences, transaction version 3, and
+zero absolute `nLockTime`. Every recovery spends the same funding outpoint, so
+every delay starts from confirmation of that funding transaction; a transfer
+does not restart the clock.
+
 `--min-reaction-blocks` defaults to 20 and must be at least 10. Before signing
 or accepting a transfer, the wallet requires:
 
 ```text
-latest recovery locktime > current tip + required reaction blocks
+latest recovery delay > funding confirmations + required reaction blocks
 ```
 
 The receiver can request a larger margin in its transfer request. The sender
 and receiver both enforce the maximum of the request's margin and their local
-wallet policy. The inequality is strict, and the tip can advance between
-transfers. Choose an initial activation locktime greater than the current tip
-plus the required reaction margin, ten blocks for every planned transfer, and
-an allowance for the blocks expected to be mined before those transfers.
+wallet policy. The inequality is strict, and funding confirmations can advance
+between transfers. Choose an initial delay greater than the required reaction
+margin, ten blocks for every planned transfer, and an allowance for the blocks
+expected to be mined before those transfers.
 
 Important operational consequences:
 
@@ -320,23 +322,23 @@ Important operational consequences:
   daemon or automatically broadcast a recovery when the chain advances.
 - Keep the current wallet online often enough to detect a changed enclave
   count, a spent funding output, and a shrinking reaction window.
-- `coin exit` cannot broadcast until the current recovery locktime is final.
-- The unrecoverable interval starts when the funding transaction is broadcast,
-  not when `coin fund` runs. `coin fund` waits for the configured confirmations,
-  so signer loss any time between broadcast and successful `coin activate` can
-  strand the funding output permanently. Plan to activate as soon as the
-  confirmation policy allows, without weakening that policy merely to shorten
-  the interval.
-- Confirm that `coin activate` or `transfer accept` has durably completed and
+- `coin exit` cannot broadcast until the funding output reaches the owner's
+  relative delay.
+- `coin fund` never broadcasts until a valid Alice recovery and its withdrawal
+  secret are in the durably synced wallet state. Signer loss before that point
+  leaves the Core wallet's source funds unbroadcast; signer loss afterward
+  leaves Alice with a unilateral recovery.
+- Confirm that `coin fund` or `transfer accept` has durably completed and
   that `coin recovery` can export the expected transaction before relying on
   it.
 - Keep every exact enclave process alive while funded coins need another
   transfer. A restart destroys all signer keys even if attestation and
   `/health` still succeed afterward.
 
-The real Regtest script exports Alice, Bob, and Carol's recoveries and verifies
-that the superseded transactions remain non-final while Carol can exit. Use
-that flow to observe the locktime ordering directly.
+The real Regtest script exports Alice, Bob, and Carol's recoveries, verifies
+their 100/90/80-block BIP68 boundaries with Bitcoin Core, and submits Carol's
+complete TRUC package. Use that flow to observe the relative-delay ordering
+directly.
 
 ## Transport modes
 
@@ -350,7 +352,9 @@ that flow to observe the locktime ordering directly.
 
 Plaintext transport requires an HTTP loopback URL. Bitcoin Core RPC is also
 Regtest-only and requires a numeric loopback URL plus a private, non-symlink
-cookie file. Production and debug attestation require all three PCR values.
+cookie file. Core configuration also requires the name of a loaded,
+private-key-enabled wallet. Production and debug attestation require all three
+PCR values.
 
 The complete image build, Enclavia deployment, PCR recording, connection, and
 lifecycle procedure is in [`enclave/README.md`](../enclave/). In
@@ -400,11 +404,30 @@ It reads `config.json` directly and does not decrypt or authenticate wallet
 state; `coin register` opens the authenticated wallet and performs its own
 attested connection.
 
+The current safe funding builder is intentionally Bitcoin Core-only and Core
+RPC is restricted to Regtest, so this revision cannot originate a new
+Mutinynet coin. Explorer-backed wallets can verify and receive an already
+funded coin, verify receipts, and submit exits. A future PSBT import flow can
+restore production origination without weakening the recovery-before-broadcast
+invariant.
+
 ### Chain backends
 
-Regtest has no default chain backend. Supply either `--chain-url` or both
-`--bitcoin-rpc-url` and `--bitcoin-cookie-file`. Bitcoin Core RPC is restricted
-to a numeric loopback HTTP URL and a private regular cookie file.
+Regtest has no default chain backend. Supply either `--chain-url` or all of
+`--bitcoin-rpc-url`, `--bitcoin-cookie-file`, and `--bitcoin-wallet`. Bitcoin
+Core RPC is restricted to a numeric loopback HTTP base URL and a private
+regular cookie file. The wallet name is encoded into the wallet RPC endpoint;
+do not include `/wallet/...` in `--bitcoin-rpc-url`.
+
+`coin fund` requires the Core backend. It uses `walletcreatefundedpsbt`,
+`walletprocesspsbt`, `finalizepsbt`, `testmempoolaccept`, and
+`sendrawtransaction`. It rejects legacy or otherwise non-native-SegWit inputs,
+RBF-signalling sequences, unconfirmed source inputs, an incomplete PSBT,
+multiple Tinylayer outputs, a changed amount, a fee above `--max-fee-sat`, or a
+returned txid that differs from the recovery outpoint. Selected inputs are
+persistently locked before enclave signing. Use one dedicated Core wallet per
+originating Tinylayer wallet and do not spend its selected inputs concurrently
+through another RPC client.
 
 Explorer URLs must use HTTPS unless the host is loopback, and cannot contain
 credentials, a query, or a fragment. A custom explorer must support the
@@ -429,12 +452,11 @@ transaction hex and return JSON with `"package_msg":"success"`.
 tinylayer-wallet --data-dir DIR [--password-file FILE] [--json] init ...
 tinylayer-wallet --data-dir DIR enclave verify
 tinylayer-wallet --data-dir DIR coin register
-tinylayer-wallet --data-dir DIR coin fund --outpoint TXID:VOUT --amount-sat SAT
-tinylayer-wallet --data-dir DIR coin activate --locktime HEIGHT
+tinylayer-wallet --data-dir DIR coin fund --amount-sat SAT --max-fee-sat SAT [--delay-blocks BLOCKS] [--fee-rate SAT_VB]
 tinylayer-wallet --data-dir DIR coin status
 tinylayer-wallet --data-dir DIR coin sign --request FILE --output FILE
 tinylayer-wallet --data-dir DIR coin recovery --output FILE
-tinylayer-wallet --data-dir DIR coin exit --destination ADDRESS --max-fee-sat SAT
+tinylayer-wallet --data-dir DIR coin exit --destination ADDRESS --max-fee-sat SAT [--dry-run]
 tinylayer-wallet --data-dir DIR transfer request ... --output FILE
 tinylayer-wallet --data-dir DIR transfer accept --request FILE --package FILE
 tinylayer-wallet --data-dir DIR receipt export --output FILE
@@ -467,8 +489,9 @@ and do not modify its contents manually.
 Each wallet directory currently holds at most one coin. Use separate data
 directories for Alice, Bob, and every other independent wallet.
 
-Wallet state and transfer artifacts currently use file format version 3 and
-have no migration command. Many payload structs reject unknown fields, but
+Wallet state and transfer artifacts currently use file format version 4 and
+have no migration command. Version 3 absolute-locktime wallets and artifacts
+are intentionally incompatible. Many payload structs reject unknown fields, but
 forward-compatible extension is not guaranteed for every tagged journal
 variant. Treat transfer requests, encrypted packages, and receipts as opaque
 artifacts for the same wallet version rather than a stable cross-version
@@ -485,26 +508,40 @@ this version.
 
 ### Interrupted operations
 
-Registration, activation, and transfer signing are journaled before an
-irreversible enclave request. If a command times out, loses its connection, or
-the wallet process crashes, rerun the same operation. Registration has no
-operation-specific arguments. For transfer signing, supply a request file with
-the exact same content; the file and output paths may differ. The wallet queries
-live status and, if the count advanced, retries the exact journaled request
-against the enclave's latest-response cache.
+Registration, funding, and transfer signing are journaled before irreversible
+effects. If a command times out, loses its connection, or the wallet process
+crashes, rerun the same operation. Registration has no operation-specific
+arguments. For transfer signing, supply a request file with the exact same
+content; the file and output paths may differ. The wallet queries live status
+and, if the count advanced, retries the exact journaled request against the
+enclave's latest-response cache.
 
-For activation, first rerun `coin activate` with the same locktime. If chain
-growth has made that locktime fail the reaction margin, rerun it with a later
-safe locktime. The wallet queries live status before changing the request. It
-supersedes the old attempt only when that attempt is proven uncommitted, while
-retaining enough journal state to recover the old response if the enclave
-actually committed it.
+For funding, rerun `coin fund` with exactly the same amount, delay, fee rate,
+and maximum fee. Its persisted stages are `Prepared`, `RecoverySecured`, and
+`Broadcast`. A crash before `RecoverySecured` cannot broadcast. A crash after
+that durable transition can safely resume broadcasting, and a lost
+`sendrawtransaction` response is reconciled against the exact wallet
+transaction bytes before any retry. An evicted unconfirmed transaction is
+rebroadcast byte-for-byte; the transaction is never rebuilt or fee-bumped.
+If the enclave response itself was already durably journaled, the wallet can
+verify its signature, finish Alice's recovery, and broadcast without reconnecting
+to the signer.
+
+Core coin selection initially locks inputs in memory. The wallet journals the
+finalized transaction before upgrading those locks to persistent storage and
+before asking the enclave to sign. If preparation fails or the process dies
+before that first journal, rerun `coin fund` first. If the wallet still reports
+only `registered` and Core shows locked inputs, no recovery signature or
+funding broadcast occurred; an operator may inspect `listlockunspent` and
+explicitly unlock those source outputs before abandoning that registration.
 
 Do not delete `wallet.enc`, create a replacement transfer request, or manually
-edit the journal to recover from an uncertain result. Only the exact latest
-request accepted by the enclave is retryable, and reconciliation requires the
-same enclave process. If that process restarted, its signing key and retry
-cache are gone.
+edit the journal to recover from an uncertain result. Before a response is
+saved, only the exact latest request accepted by the enclave is retryable and
+reconciliation requires the same enclave process. Transfer completion also
+requires live status. If that process restarted, its signing key and retry
+cache are gone; only a saved initial-funding response or an already secured
+recovery can complete without it.
 
 Transfer JSON outputs may already exist only when their content exactly matches
 the artifact being written; the wallet refuses to replace different content.
@@ -558,6 +595,8 @@ exercise Nitro hardware.
 ## Current limitations
 
 - Mainnet is not supported.
+- Safe funding origination currently requires a Regtest Bitcoin Core wallet;
+  there is not yet a PSBT import flow for Mutinynet or hardware wallets.
 - The workload stores signing state only in memory; restarting it loses every
   registered coin and retry record.
 - A wallet directory holds one coin and has no reset or import command.

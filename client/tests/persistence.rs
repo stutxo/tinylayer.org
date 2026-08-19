@@ -5,7 +5,7 @@ use tinylayer_client::{
     verify_recovery,
 };
 
-use support::{CAP_0, CAP_A, LOCKTIME, opened, xonly};
+use support::{CAP_0, CAP_A, DELAY_BLOCKS, opened, xonly};
 
 #[test]
 fn prepared_recovery_round_trips_without_serializing_secret_or_derived_taproot_data() {
@@ -19,7 +19,7 @@ fn prepared_recovery_round_trips_without_serializing_secret_or_derived_taproot_d
         INITIAL_HANDOFF,
         capability_hash(&CAP_A),
         xonly(4),
-        LOCKTIME,
+        DELAY_BLOCKS,
         0,
     )
     .unwrap();
@@ -29,6 +29,8 @@ fn prepared_recovery_round_trips_without_serializing_secret_or_derived_taproot_d
     assert!(!text.contains("output_key"));
     assert!(!text.contains("control_block"));
     assert!(!text.contains("tapscript"));
+    assert!(text.contains("delay_blocks"));
+    assert!(!text.contains("locktime"));
 
     let restored: PreparedRecovery = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(restored, prepared);
@@ -49,7 +51,7 @@ fn restored_preparation_rejects_unknown_and_tampered_fields() {
         INITIAL_HANDOFF,
         capability_hash(&CAP_A),
         xonly(4),
-        LOCKTIME,
+        DELAY_BLOCKS,
         0,
     )
     .unwrap();
@@ -65,4 +67,21 @@ fn restored_preparation_rejects_unknown_and_tampered_fields() {
         complete_recovery(&request, &response, malformed, opened.client_secret,),
         Err(Error::TransactionMismatch)
     );
+
+    let mut value = serde_json::to_value(&prepared).unwrap();
+    value["delay_blocks"] = serde_json::json!(DELAY_BLOCKS + 1);
+    let changed_delay: PreparedRecovery = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        complete_recovery(&request, &response, changed_delay, opened.client_secret,),
+        Err(Error::TransactionMismatch)
+    );
+
+    let mut legacy = serde_json::to_value(&prepared).unwrap();
+    let delay = legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("delay_blocks")
+        .unwrap();
+    legacy["locktime"] = delay;
+    assert!(serde_json::from_value::<PreparedRecovery>(legacy).is_err());
 }

@@ -22,7 +22,7 @@ does not know:
 - Constructing the canonical recovery transaction and its Taproot sighash.
 - Verifying the enclave signature before adding the client signature.
 - Verifying every prior recovery, signature count, authorization commitment,
-  withdrawal key, and decreasing locktime.
+  withdrawal key, and decreasing relative delay.
 - Persisting secrets, prepared requests, responses, and signed history around
   irreversible network calls.
 
@@ -125,11 +125,21 @@ let script_pubkey = funding_script(&keys);
 Do not fund until registration has been completed and the enclave identity has
 been independently pinned.
 
-### 2. Bind and verify funding
+### 2. Bind and verify prepared funding
 
-After funding, combine `CoinKeys` with the network, exact outpoint, and amount
-using `CoinKeys::metadata`. Obtain the output and current tip from an honest
-chain backend, then call `verify_funding_utxo`.
+Finalize the funding transaction without broadcasting it, derive its txid and
+Tinylayer output index, then combine `CoinKeys` with the network, exact
+outpoint, and amount using `CoinKeys::metadata`. Call `verify_funding_utxo`
+against the finalized output before requesting a recovery signature. After
+broadcast, repeat this verification through an honest chain backend.
+
+The funding txid must be stable before the recovery is signed. A safe builder
+must use confirmed native SegWit or Taproot inputs, avoid signalling
+replacement, preserve the exact finalized bytes, and never fee-bump or rebuild
+the transaction after signing. Isolate the source wallet from concurrent
+spenders; non-RBF policy is not a consensus-level prohibition on a conflicting
+transaction. The reference wallet enforces the local construction rules with
+Bitcoin Core.
 
 The funding script is a one-leaf P2TR tree under the BIP341 NUMS internal key:
 
@@ -150,22 +160,24 @@ Query `RemoteEnclave::status`, call `verify_status`, and then call
 - Current capability and handoff.
 - Hash of a fresh next capability.
 - Current owner's withdrawal x-only public key.
-- Absolute block-height locktime and observed chain tip.
+- BIP68 block-relative delay and current funding confirmation count. Use zero
+  confirmations while the finalized funding transaction is still unbroadcast.
 
-`prepare_recovery` checks authorization, metadata, keys, future locktime,
+`prepare_recovery` checks authorization, metadata, keys, unexpired delay,
 amount bounds, dust, and canonical transaction construction. It returns a
 `SignRequest` and opaque `PreparedRecovery`.
 
-For every transfer after activation, the caller must derive the new locktime as
-the previous recovery's locktime minus `LOCKTIME_STEP` and enforce its reaction
-margin before sending the irreversible request. `prepare_recovery` has no
+For every transfer, the caller must derive the new delay as the previous
+recovery's `delay_blocks` minus `DELAY_STEP` and enforce its reaction margin
+before sending the irreversible request. `prepare_recovery` has no
 history argument and therefore cannot enforce that decrement. `verify_history`
 will reject a wrong step afterward, but by then a successful `sign` call has
 already rotated enclave authorization.
 
 Persist both values before sending the request. The canonical recovery is a
-version-3/TRUC transaction with one funding input, one full-value P2TR output,
-and no fee. It is intended to be broadcast later with a fee-paying TRUC child.
+version-3/TRUC transaction with `nLockTime = 0`, one funding input whose
+sequence encodes the block-relative delay, one full-value P2TR output, and no
+fee. It is intended to be broadcast later with a fee-paying TRUC child.
 
 ### 4. Commit and verify signing
 
@@ -200,8 +212,8 @@ Every successful signature rotates authorization and adds one signed recovery.
 - `signature_count` equals the complete history length.
 - Every recovery is canonical and has both valid signatures.
 - The latest recovery pays the expected current withdrawal key.
-- Each newer recovery locktime is exactly ten blocks earlier than the previous
-  recovery and remains in the future.
+- Each newer recovery delay is exactly ten blocks shorter than the previous
+  recovery and remains safely greater than the funding confirmation count.
 
 The client signing key stays with the coin and is transferred to the next
 owner. The receiver contributes a fresh capability and withdrawal key. The
@@ -209,14 +221,16 @@ wallet adds encrypted transfer packaging, chain confirmation policy, and a
 minimum reaction margin on top of these library checks.
 
 Previous owners retain their already signed recoveries. Safety depends on each
-new owner receiving an earlier locktime and having enough time to react on
-chain. The library verifies the ten-block decrement when checking complete
+new owner receiving a shorter delay and having enough time to react on chain.
+All delays start from confirmation of the same funding transaction. The
+library verifies the ten-block decrement when checking complete
 history; the calling application must enforce it before signing and choose and
 monitor an adequate policy margin.
 
 ### 6. Exit
 
-Once the current owner's recovery locktime is final, `build_exit_child`
+Once the funding output has reached the current owner's relative delay,
+`build_exit_child`
 constructs and signs the fee-paying version-3 child. The parent and child must
 be submitted as a package. The caller must choose a fee rate from a trusted
 recommendation or explicit policy, impose an appropriate maximum fee, and
@@ -244,10 +258,22 @@ The crate's staged values are serializable so applications can journal them.
 A safe integration must durably persist:
 
 - Registration secrets and prepared registration before `register`.
+- Exact finalized funding bytes and metadata before requesting the first
+  recovery signature.
 - The exact `SignRequest` and `PreparedRecovery` before `sign`.
 - A returned response before discarding the old capability/handoff.
 - Complete recovery history and current ownership secrets as one committed
   state transition.
+
+The funding transaction must not be broadcast until that final state
+transition has been durably persisted and independently verified.
+
+The relative-delay `PreparedRecovery` and `SignedRecovery` JSON schemas are a
+breaking change: old `locktime` records are rejected and cannot be converted
+after signing because sequence and locktime are part of the sighash. This crate
+does not add a format field to those low-level values; external integrators
+must version the journal that contains them. The reference wallet uses file
+format version 4 and has no version 3 migration.
 
 Never resolve an uncertain network result by creating another request. Query
 status first. If count and authorization still equal the prepared request's old

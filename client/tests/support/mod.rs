@@ -13,7 +13,7 @@ use tinylayer_client::{
 use tinylayer_enclave::Enclave;
 
 pub const AMOUNT: u64 = 100_000;
-pub const LOCKTIME: u32 = 1_000;
+pub const DELAY_BLOCKS: u32 = 100;
 pub const CAP_0: [u8; 32] = [0x90; 32];
 pub const CAP_A: [u8; 32] = [0xa1; 32];
 pub const CAP_B: [u8; 32] = [0xb2; 32];
@@ -47,7 +47,7 @@ pub fn sign(
     handoff: HandoffToken,
     next_capability_hash: [u8; 32],
     withdrawal_key: XOnlyPublicKey,
-    locktime: u32,
+    delay_blocks: u32,
 ) -> (SignedRecovery, HandoffToken) {
     let before = enclave.status(metadata.keys.coin_id).unwrap();
     let (request, prepared) = prepare_recovery(
@@ -58,7 +58,7 @@ pub fn sign(
         handoff,
         next_capability_hash,
         withdrawal_key,
-        locktime,
+        delay_blocks,
         0,
     )
     .unwrap();
