@@ -1,8 +1,10 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     net::TcpListener,
     path::Path,
     process::Command,
+    str::FromStr as _,
     sync::{Arc, Mutex, mpsc},
     thread,
 };
@@ -34,9 +36,11 @@ struct CoreState {
     funding: Arc<Mutex<Option<Funding>>>,
     prepared: Arc<Mutex<Option<Transaction>>>,
     broadcasts: Arc<Mutex<Vec<String>>>,
+    confirmed_transactions: Arc<Mutex<HashMap<Txid, Transaction>>>,
     locked_inputs: Arc<Mutex<Vec<OutPoint>>>,
     lock_calls: Arc<Mutex<u32>>,
     in_mempool: Arc<Mutex<bool>>,
+    hide_wallet_transactions: Arc<Mutex<bool>>,
     tip: Arc<Mutex<u64>>,
     confirmations: Arc<Mutex<u32>>,
 }
@@ -47,9 +51,11 @@ impl Default for CoreState {
             funding: Arc::new(Mutex::new(None)),
             prepared: Arc::new(Mutex::new(None)),
             broadcasts: Arc::new(Mutex::new(Vec::new())),
+            confirmed_transactions: Arc::new(Mutex::new(HashMap::new())),
             locked_inputs: Arc::new(Mutex::new(Vec::new())),
             lock_calls: Arc::new(Mutex::new(0)),
             in_mempool: Arc::new(Mutex::new(false)),
+            hide_wallet_transactions: Arc::new(Mutex::new(false)),
             tip: Arc::new(Mutex::new(900)),
             confirmations: Arc::new(Mutex::new(6)),
         }
@@ -114,6 +120,7 @@ fn alice_bob_carol_use_separate_cli_wallets() {
     assert_eq!(funded["delay_blocks"], 100);
     let outpoint = funded["outpoint"].as_str().unwrap().to_owned();
     assert_eq!(core_state.broadcasts.lock().unwrap().len(), 1);
+    *core_state.hide_wallet_transactions.lock().unwrap() = true;
 
     let wrong_request = temporary.path().join("wrong-amount-request.json");
     let wrong_package = temporary.path().join("wrong-amount-package.json");
@@ -175,7 +182,7 @@ fn alice_bob_carol_use_separate_cli_wallets() {
     );
     let bob_request_json: Value =
         serde_json::from_str(&fs::read_to_string(&bob_request).unwrap()).unwrap();
-    assert_eq!(bob_request_json["format_version"], 4);
+    assert_eq!(bob_request_json["format_version"], 1);
     assert_eq!(bob_request_json["protocol_version"], 1);
     assert_eq!(bob_request_json["expected_amount_sat"], AMOUNT_SAT);
     assert_no_raw_handoff(&bob_request_json);
@@ -369,7 +376,7 @@ fn alice_bob_carol_use_separate_cli_wallets() {
         &["receipt", "export", "--output", receipt.to_str().unwrap()],
     );
     let receipt_json: Value = serde_json::from_str(&fs::read_to_string(&receipt).unwrap()).unwrap();
-    assert_eq!(receipt_json["format_version"], 4);
+    assert_eq!(receipt_json["format_version"], 1);
     assert_eq!(receipt_json["protocol_version"], 1);
     assert_no_raw_handoff(&receipt_json);
     let incompatible_receipt = temporary.path().join("protocol-2-receipt.json");
@@ -453,7 +460,7 @@ fn alice_bob_carol_use_separate_cli_wallets() {
     assert!(encrypted_package.contains("ciphertext"));
     assert!(!encrypted_package.contains("client_secret"));
     let encrypted_package_json: Value = serde_json::from_str(&encrypted_package).unwrap();
-    assert_eq!(encrypted_package_json["format_version"], 4);
+    assert_eq!(encrypted_package_json["format_version"], 1);
     assert_no_raw_handoff(&encrypted_package_json);
     assert!(
         !fs::read_to_string(alice.join("wallet.enc"))
@@ -507,7 +514,7 @@ fn funding_is_never_broadcast_before_recovery_is_durable() {
     }
 
     assert_eq!(
-        run_failure_without_enclave(&alice, &fund, "after_recovery_secured")["error"],
+        run_failure_with_env(&alice, &fund, "after_recovery_secured")["error"],
         "stopped at test failpoint after_recovery_secured"
     );
     assert!(core_state.broadcasts.lock().unwrap().is_empty());
@@ -609,7 +616,7 @@ fn default_and_explicit_confirmation_policies_are_enforced() {
     let default_config: Value =
         serde_json::from_str(&fs::read_to_string(default_wallet.join("config.json")).unwrap())
             .unwrap();
-    assert_eq!(default_config["format_version"], 4);
+    assert_eq!(default_config["format_version"], 1);
     assert_eq!(default_config["protocol_version"], 1);
     assert_eq!(default_config["min_confirmations"], 6);
     let registered = run(&default_wallet, &["coin", "register"]);
@@ -696,6 +703,79 @@ fn default_and_explicit_confirmation_policies_are_enforced() {
 }
 
 #[test]
+fn core_exit_resumes_when_only_the_parent_is_confirmed_without_txindex() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cookie = temporary.path().join("bitcoin.cookie");
+    fs::write(&cookie, "user:password\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&cookie, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let (enclave_url, core_url, core_state) = start_servers();
+    let alice = temporary.path().join("alice");
+    initialize(&alice, &enclave_url, &core_url, &cookie);
+    run(&alice, &["coin", "register"]);
+    run(
+        &alice,
+        &[
+            "coin",
+            "fund",
+            "--amount-sat",
+            "100000",
+            "--delay-blocks",
+            "100",
+            "--max-fee-sat",
+            "1000",
+        ],
+    );
+    *core_state.confirmations.lock().unwrap() = 100;
+    let destination = destination_address();
+    let exit = [
+        "coin",
+        "exit",
+        "--destination",
+        &destination,
+        "--fee-rate",
+        "2",
+        "--max-fee-sat",
+        "10000",
+    ];
+    let dry_run = run(
+        &alice,
+        &[
+            "coin",
+            "exit",
+            "--destination",
+            &destination,
+            "--fee-rate",
+            "2",
+            "--max-fee-sat",
+            "10000",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(
+        run_failure_with_env(&alice, &exit, "after_exit_armed")["error"],
+        "stopped at test failpoint after_exit_armed"
+    );
+    let parent: Transaction =
+        deserialize(&hex::decode(dry_run["parent_hex"].as_str().unwrap()).unwrap()).unwrap();
+    let child: Transaction =
+        deserialize(&hex::decode(dry_run["child_hex"].as_str().unwrap()).unwrap()).unwrap();
+    core_state
+        .confirmed_transactions
+        .lock()
+        .unwrap()
+        .insert(parent.compute_txid(), parent);
+
+    let exited = run(&alice, &exit);
+    assert_eq!(exited["status"], "package_submitted");
+    assert_eq!(exited["exit_txid"], child.compute_txid().to_string());
+    assert_eq!(core_state.broadcasts.lock().unwrap().len(), 2);
+}
+
+#[test]
 fn mainnet_is_unavailable_from_cli_and_handcrafted_config() {
     let temporary = tempfile::tempdir().unwrap();
     let rejected = Command::new(env!("CARGO_BIN_EXE_tinylayer-wallet"))
@@ -746,6 +826,216 @@ fn mainnet_is_unavailable_from_cli_and_handcrafted_config() {
 }
 
 #[test]
+fn production_init_rejects_debug_pcrs_before_writing_wallet_state() {
+    let temporary = tempfile::tempdir().unwrap();
+    let wallet = temporary.path().join("invalid-production");
+    let zero = "00".repeat(48);
+    let nonzero = "11".repeat(48);
+    let error = run_failure(
+        &wallet,
+        &[
+            "init",
+            "--network",
+            "mutinynet",
+            "--enclave-url",
+            "wss://example.invalid",
+            "--pcr0",
+            &zero,
+            "--pcr1",
+            &nonzero,
+            "--pcr2",
+            &nonzero,
+        ],
+    );
+    assert!(error["error"].as_str().unwrap().contains("all-zero"));
+    assert!(!wallet.exists());
+}
+
+#[test]
+fn explorer_wallet_funds_from_its_deposit_key_and_sweeps_exact_bytes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let (enclave_url, explorer_url, explorer_state) = start_explorer_servers();
+    let explorer_url = format!("{explorer_url}/api");
+    let wallet = temporary.path().join("wallet");
+    let initialized = run(
+        &wallet,
+        &[
+            "init",
+            "--network",
+            "regtest",
+            "--enclave-url",
+            &enclave_url,
+            "--unsafe-plaintext",
+            "--chain-url",
+            &explorer_url,
+            "--min-confirmations",
+            "1",
+        ],
+    );
+    assert_eq!(initialized["status"], "initialized");
+    let first_address = run(&wallet, &["coin", "deposit-address"]);
+    let second_address = run(&wallet, &["coin", "deposit-address"]);
+    assert_eq!(first_address["address"], second_address["address"]);
+    let deposit_address =
+        Address::<NetworkUnchecked>::from_str(first_address["address"].as_str().unwrap())
+            .unwrap()
+            .require_network(bitcoin::Network::Regtest)
+            .unwrap();
+    run(&wallet, &["coin", "register"]);
+
+    let source = deposit_transaction(deposit_address.script_pubkey(), 160_000, 31);
+    let source_outpoint = OutPoint::new(source.compute_txid(), 0);
+    explorer_state.observe(source, 6);
+    let fund = [
+        "coin",
+        "fund",
+        "--amount-sat",
+        "100000",
+        "--delay-blocks",
+        "100",
+        "--fee-rate",
+        "1",
+        "--max-fee-sat",
+        "1000",
+    ];
+    assert_eq!(
+        run_failure_with_env(&wallet, &fund, "after_funding_broadcast")["error"],
+        "stopped at test failpoint after_funding_broadcast"
+    );
+    assert_eq!(explorer_state.broadcasts.lock().unwrap().len(), 1);
+    let pending_funding: Transaction =
+        deserialize(&hex::decode(explorer_state.broadcasts.lock().unwrap()[0].clone()).unwrap())
+            .unwrap();
+    let pending_funding_txid = pending_funding.compute_txid();
+    explorer_state
+        .hidden_summaries
+        .lock()
+        .unwrap()
+        .insert(pending_funding_txid);
+    assert!(
+        run_failure(&wallet, &fund)["error"]
+            .as_str()
+            .unwrap()
+            .contains("did not expose its exact bytes")
+    );
+    assert_eq!(explorer_state.broadcasts.lock().unwrap().len(), 1);
+    explorer_state
+        .hidden_summaries
+        .lock()
+        .unwrap()
+        .remove(&pending_funding_txid);
+    let funded = run_without_enclave(&wallet, &fund);
+    assert_eq!(funded["status"], "funding_broadcast");
+    assert_eq!(explorer_state.broadcasts.lock().unwrap().len(), 1);
+    let funding_txid: Txid = funded["funding_txid"].as_str().unwrap().parse().unwrap();
+    let funding = explorer_state
+        .transactions
+        .lock()
+        .unwrap()
+        .get(&funding_txid)
+        .unwrap()
+        .transaction
+        .clone();
+    assert_eq!(funding.input[0].previous_output, source_outpoint);
+    assert_eq!(funding.output[0].value.to_sat(), AMOUNT_SAT);
+    assert_eq!(
+        funding.output[1].script_pubkey,
+        deposit_address.script_pubkey()
+    );
+    assert_eq!(
+        run_without_enclave(&wallet, &fund)["status"],
+        "already_funded"
+    );
+    assert_eq!(explorer_state.broadcasts.lock().unwrap().len(), 1);
+
+    explorer_state.set_confirmations(funding_txid, 6);
+    explorer_state.observe(
+        deposit_transaction(deposit_address.script_pubkey(), 40_000, 32),
+        3,
+    );
+    let destination = destination_address();
+    let sweep = [
+        "coin",
+        "source-sweep",
+        "--destination",
+        &destination,
+        "--fee-rate",
+        "1",
+        "--max-fee-sat",
+        "1000",
+    ];
+    assert_eq!(
+        run_failure_with_env(&wallet, &sweep, "after_sweep_prepared")["error"],
+        "stopped at test failpoint after_sweep_prepared"
+    );
+    assert_eq!(explorer_state.broadcasts.lock().unwrap().len(), 1);
+    let replacement_sweep = [
+        "coin",
+        "source-sweep",
+        "--destination",
+        &destination,
+        "--fee-rate",
+        "2",
+        "--max-fee-sat",
+        "1000",
+    ];
+    assert_eq!(
+        run_failure_with_env(&wallet, &replacement_sweep, "after_sweep_broadcast")["error"],
+        "stopped at test failpoint after_sweep_broadcast"
+    );
+    assert_eq!(explorer_state.broadcasts.lock().unwrap().len(), 2);
+    let swept = run(&wallet, &replacement_sweep);
+    assert_eq!(swept["status"], "source_sweep_observed");
+    assert_eq!(swept["input_count"], 2);
+    assert_eq!(explorer_state.broadcasts.lock().unwrap().len(), 2);
+    let sweep_txid: Txid = swept["txid"].as_str().unwrap().parse().unwrap();
+    let sweep_transaction = explorer_state
+        .transactions
+        .lock()
+        .unwrap()
+        .get(&sweep_txid)
+        .unwrap()
+        .transaction
+        .clone();
+    assert_eq!(sweep_transaction.input.len(), 2);
+    let destination = Address::<NetworkUnchecked>::from_str(&destination)
+        .unwrap()
+        .require_network(bitcoin::Network::Regtest)
+        .unwrap();
+    assert_eq!(
+        sweep_transaction.output[0].script_pubkey,
+        destination.script_pubkey()
+    );
+
+    explorer_state.set_confirmations(sweep_txid, 1);
+    explorer_state.observe(
+        deposit_transaction(deposit_address.script_pubkey(), 25_000, 33),
+        2,
+    );
+    let second_sweep = run(&wallet, &replacement_sweep);
+    assert_eq!(second_sweep["status"], "source_sweep_broadcast");
+    assert_eq!(second_sweep["input_count"], 1);
+    assert_eq!(explorer_state.broadcasts.lock().unwrap().len(), 3);
+}
+
+fn deposit_transaction(script_pubkey: ScriptBuf, value_sat: u64, tag: u8) -> Transaction {
+    Transaction {
+        version: Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(Txid::from_byte_array([tag; 32]), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::from_slice(&[[tag; 64]]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value_sat),
+            script_pubkey,
+        }],
+    }
+}
+
+#[test]
 fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
     let temporary = tempfile::tempdir().unwrap();
     let cookie = temporary.path().join("bitcoin.cookie");
@@ -755,7 +1045,7 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(&cookie, fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let (enclave_url, core_url, _core_state) = start_servers();
+    let (enclave_url, core_url, core_state) = start_servers();
     let (_unused_enclave, explorer_url, explorer_state) = start_explorer_servers();
     let explorer_url = format!("{explorer_url}/api");
     let alice = temporary.path().join("alice");
@@ -793,13 +1083,28 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
         ],
     );
     let outpoint = funded["outpoint"].as_str().unwrap().to_owned();
-    *explorer_state.funding.lock().unwrap() = Some(Funding {
-        outpoint: outpoint.clone(),
-        script_hex: registered["funding_script_hex"]
-            .as_str()
-            .unwrap()
-            .to_owned(),
-    });
+    let funding_transaction = core_state
+        .prepared
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("prepared funding transaction");
+    let funding_txid = funding_transaction.compute_txid();
+    explorer_state.observe(funding_transaction, 6);
+    let alice_recovery_path = temporary.path().join("alice-recovery.hex");
+    run(
+        &alice,
+        &[
+            "coin",
+            "recovery",
+            "--output",
+            alice_recovery_path.to_str().unwrap(),
+        ],
+    );
+    let alice_recovery: Transaction = deserialize(
+        &hex::decode(fs::read_to_string(&alice_recovery_path).unwrap().trim()).unwrap(),
+    )
+    .unwrap();
     let request = temporary.path().join("bob-request.json");
     let package = temporary.path().join("alice-to-bob.json");
     run(
@@ -817,17 +1122,34 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
             request.to_str().unwrap(),
         ],
     );
-    run(
-        &alice,
-        &[
-            "coin",
-            "sign",
-            "--request",
-            request.to_str().unwrap(),
-            "--output",
-            package.to_str().unwrap(),
-        ],
+    let destination = destination_address();
+    let sign = [
+        "coin",
+        "sign",
+        "--request",
+        request.to_str().unwrap(),
+        "--output",
+        package.to_str().unwrap(),
+    ];
+    assert_eq!(
+        run_failure_with_env(&alice, &sign, "after_sign")["error"],
+        "stopped at test failpoint after_sign"
     );
+    assert_eq!(
+        run_failure(
+            &alice,
+            &[
+                "coin",
+                "exit",
+                "--destination",
+                &destination,
+                "--max-fee-sat",
+                "10000",
+            ],
+        )["error"],
+        "wallet has a pending operation; finish it before exiting"
+    );
+    run(&alice, &sign);
     run(
         &bob,
         &[
@@ -840,7 +1162,6 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
         ],
     );
 
-    let destination = destination_address();
     assert!(
         run_failure(
             &bob,
@@ -866,7 +1187,24 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
     let parent_hex = fs::read_to_string(&recovery).unwrap().trim().to_owned();
 
     *explorer_state.tip.lock().unwrap() = 1_000;
-    *explorer_state.confirmations.lock().unwrap() = 90;
+    explorer_state.set_confirmations(funding_txid, 100);
+    *core_state.confirmations.lock().unwrap() = 100;
+    assert_eq!(
+        run_failure_with_env(
+            &alice,
+            &[
+                "coin",
+                "exit",
+                "--destination",
+                &destination,
+                "--max-fee-sat",
+                "10000",
+            ],
+            "after_exit_prepared",
+        )["error"],
+        "stopped at test failpoint after_exit_prepared"
+    );
+    assert_eq!(run(&alice, &sign)["status"], "already_transferred");
     assert_eq!(
         run_failure(
             &bob,
@@ -920,7 +1258,19 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
             .contains("exceeds maximum 0 sat")
     );
     assert!(explorer_state.packages.lock().unwrap().is_empty());
-    let exited = run(
+    let exit = [
+        "coin",
+        "exit",
+        "--destination",
+        &destination,
+        "--max-fee-sat",
+        "10000",
+    ];
+    assert_eq!(
+        run_failure_with_env(&bob, &exit, "after_exit_prepared")["error"],
+        "stopped at test failpoint after_exit_prepared"
+    );
+    let saved_dry_run = run(
         &bob,
         &[
             "coin",
@@ -929,10 +1279,34 @@ fn explorer_backed_wallet_exits_with_a_fee_paying_child() {
             &destination,
             "--max-fee-sat",
             "10000",
+            "--dry-run",
         ],
     );
+    assert_eq!(saved_dry_run["status"], "package_prepared");
+    assert_eq!(saved_dry_run["parent_hex"], parent_hex);
+    explorer_state.set_confirmations(funding_txid, 50);
+    assert!(
+        run_failure(&bob, &exit)["error"]
+            .as_str()
+            .unwrap()
+            .contains("not final")
+    );
+    assert!(explorer_state.packages.lock().unwrap().is_empty());
+    explorer_state.set_confirmations(funding_txid, 100);
+    explorer_state.observe(alice_recovery, 0);
+    let replacement_exit = [
+        "coin",
+        "exit",
+        "--destination",
+        &destination,
+        "--fee-rate",
+        "2",
+        "--max-fee-sat",
+        "10000",
+    ];
+    let exited = run(&bob, &replacement_exit);
     assert_eq!(exited["status"], "package_submitted");
-    assert_eq!(exited["fee_rate_sat_vb"], 1);
+    assert_eq!(exited["fee_rate_sat_vb"], 2);
 
     let packages = explorer_state.packages.lock().unwrap().clone();
     assert_eq!(packages.len(), 1);
@@ -950,10 +1324,48 @@ fn destination_address() -> String {
 
 #[derive(Clone)]
 struct ExplorerState {
-    funding: Arc<Mutex<Option<Funding>>>,
     tip: Arc<Mutex<u64>>,
-    confirmations: Arc<Mutex<u32>>,
+    transactions: Arc<Mutex<HashMap<Txid, ExplorerTransaction>>>,
+    hidden_summaries: Arc<Mutex<HashSet<Txid>>>,
+    outspends: Arc<Mutex<HashMap<OutPoint, Txid>>>,
     packages: Arc<Mutex<Vec<Vec<String>>>>,
+    broadcasts: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Clone)]
+struct ExplorerTransaction {
+    transaction: Transaction,
+    confirmations: u32,
+}
+
+impl ExplorerState {
+    fn observe(&self, transaction: Transaction, confirmations: u32) {
+        let txid = transaction.compute_txid();
+        {
+            let mut outspends = self.outspends.lock().unwrap();
+            for input in &transaction.input {
+                if !input.previous_output.is_null() {
+                    outspends.insert(input.previous_output, txid);
+                }
+            }
+        }
+        self.transactions.lock().unwrap().insert(
+            txid,
+            ExplorerTransaction {
+                transaction,
+                confirmations,
+            },
+        );
+    }
+
+    fn set_confirmations(&self, txid: Txid, confirmations: u32) {
+        self.transactions
+            .lock()
+            .unwrap()
+            .get_mut(&txid)
+            .expect("observed transaction")
+            .confirmations = confirmations;
+    }
 }
 
 fn start_explorer_servers() -> (String, String, ExplorerState) {
@@ -964,10 +1376,12 @@ fn start_explorer_servers() -> (String, String, ExplorerState) {
     let enclave_address = enclave_listener.local_addr().unwrap();
     let explorer_address = explorer_listener.local_addr().unwrap();
     let explorer_state = ExplorerState {
-        funding: Arc::new(Mutex::new(None)),
         tip: Arc::new(Mutex::new(900)),
-        confirmations: Arc::new(Mutex::new(6)),
+        transactions: Arc::new(Mutex::new(HashMap::new())),
+        hidden_summaries: Arc::new(Mutex::new(HashSet::new())),
+        outspends: Arc::new(Mutex::new(HashMap::new())),
         packages: Arc::new(Mutex::new(Vec::new())),
+        broadcasts: Arc::new(Mutex::new(Vec::new())),
     };
     let server_state = explorer_state.clone();
     let (ready_tx, ready_rx) = mpsc::channel();
@@ -980,8 +1394,13 @@ fn start_explorer_servers() -> (String, String, ExplorerState) {
                 .route("/api/blocks/tip/height", get(explorer_tip))
                 .route("/api/block-height/{height}", get(explorer_block_hash))
                 .route("/api/tx/{txid}", get(explorer_tx))
+                .route("/api/tx/{txid}/hex", get(explorer_tx_hex))
+                .route("/api/tx/{txid}/outspend/{vout}", get(explorer_outspend))
                 .route("/api/tx/{txid}/outspends", get(explorer_outspends))
+                .route("/api/address/{address}/utxo", get(explorer_address_utxos))
+                .route("/api/tx", post(explorer_broadcast))
                 .route("/api/v1/fees/recommended", get(explorer_fees))
+                .route("/api/txs/package", post(explorer_package))
                 .route("/api/v1/txs/package", post(explorer_package))
                 .with_state(server_state);
             ready_tx.send(()).unwrap();
@@ -999,76 +1418,169 @@ fn start_explorer_servers() -> (String, String, ExplorerState) {
     )
 }
 
-fn funding_vout(funding: &Funding) -> u64 {
-    funding
-        .outpoint
-        .rsplit_once(':')
-        .and_then(|(_, vout)| vout.parse().ok())
-        .unwrap_or(0)
-}
-
-fn funding_tx_json(state: &ExplorerState, txid: &str) -> Option<Value> {
-    let funding = state.funding.lock().unwrap();
-    let funding = funding.as_ref()?;
-    let (funding_txid, _) = funding.outpoint.rsplit_once(':')?;
-    if funding_txid != txid {
-        return None;
+fn explorer_status(state: &ExplorerState, confirmations: u32) -> Value {
+    if confirmations == 0 {
+        return json!({ "confirmed": false });
     }
-    let vout = funding_vout(funding) as usize;
-    let mut outputs = vec![json!({ "value": 0, "scriptpubkey": "" }); vout];
-    outputs.push(json!({
-        "value": AMOUNT_SAT,
-        "scriptpubkey": funding.script_hex,
-    }));
     let tip = *state.tip.lock().unwrap();
-    let confirmations = u64::from(*state.confirmations.lock().unwrap());
-    Some(json!({
-        "txid": txid,
-        "status": {
-            "confirmed": true,
-            "block_height": tip - confirmations + 1,
-            "block_hash": "11".repeat(32),
-        },
-        "vin": [{ "is_coinbase": false }],
-        "vout": outputs,
-    }))
+    json!({
+        "confirmed": true,
+        "block_height": tip - u64::from(confirmations) + 1,
+        "block_hash": "11".repeat(32),
+    })
 }
 
 async fn explorer_tip(State(state): State<ExplorerState>) -> String {
     state.tip.lock().unwrap().to_string()
 }
 
-async fn explorer_block_hash() -> String {
-    "11".repeat(32)
+async fn explorer_block_hash(AxumPath(height): AxumPath<u64>) -> String {
+    if height == 0 {
+        bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
+            .block_hash()
+            .to_string()
+    } else {
+        "11".repeat(32)
+    }
 }
 
 async fn explorer_tx(
     State(state): State<ExplorerState>,
     AxumPath(txid): AxumPath<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    funding_tx_json(&state, &txid)
-        .map(Json)
+    let txid: Txid = txid.parse().map_err(|_| StatusCode::NOT_FOUND)?;
+    if state.hidden_summaries.lock().unwrap().contains(&txid) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let observed = state
+        .transactions
+        .lock()
+        .unwrap()
+        .get(&txid)
+        .cloned()
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(json!({
+        "txid": txid,
+        "status": explorer_status(&state, observed.confirmations),
+        "vin": [{ "is_coinbase": observed.transaction.is_coinbase() }],
+        "vout": observed.transaction.output.iter().map(|output| json!({
+            "value": output.value.to_sat(),
+            "scriptpubkey": hex::encode(output.script_pubkey.as_bytes()),
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn explorer_tx_hex(
+    State(state): State<ExplorerState>,
+    AxumPath(txid): AxumPath<String>,
+) -> Result<String, StatusCode> {
+    let txid: Txid = txid.parse().map_err(|_| StatusCode::NOT_FOUND)?;
+    state
+        .transactions
+        .lock()
+        .unwrap()
+        .get(&txid)
+        .map(|observed| serialize_hex(&observed.transaction))
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn explorer_outspend(
+    State(state): State<ExplorerState>,
+    AxumPath((txid, vout)): AxumPath<(String, u32)>,
+) -> Result<Json<Value>, StatusCode> {
+    let txid = txid.parse().map_err(|_| StatusCode::NOT_FOUND)?;
+    let outpoint = OutPoint::new(txid, vout);
+    let transactions = state.transactions.lock().unwrap();
+    let funding = transactions.get(&txid).ok_or(StatusCode::NOT_FOUND)?;
+    if funding.transaction.output.get(vout as usize).is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let spending_txid = state.outspends.lock().unwrap().get(&outpoint).copied();
+    let Some(spending_txid) = spending_txid else {
+        return Ok(Json(json!({ "spent": false })));
+    };
+    let spending = transactions
+        .get(&spending_txid)
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(json!({
+        "spent": true,
+        "txid": spending_txid,
+        "vin": spending.transaction.input.iter().position(|input| input.previous_output == outpoint),
+        "status": explorer_status(&state, spending.confirmations),
+    })))
 }
 
 async fn explorer_outspends(
     State(state): State<ExplorerState>,
     AxumPath(txid): AxumPath<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    let funding = state.funding.lock().unwrap();
-    let funding = funding.as_ref().ok_or(StatusCode::NOT_FOUND)?;
-    let (funding_txid, _) = funding
-        .outpoint
-        .rsplit_once(':')
-        .ok_or(StatusCode::NOT_FOUND)?;
-    if funding_txid != txid {
-        return Err(StatusCode::NOT_FOUND);
+    let txid: Txid = txid.parse().map_err(|_| StatusCode::NOT_FOUND)?;
+    let output_count = state
+        .transactions
+        .lock()
+        .unwrap()
+        .get(&txid)
+        .ok_or(StatusCode::NOT_FOUND)?
+        .transaction
+        .output
+        .len();
+    let outspends = state.outspends.lock().unwrap();
+    Ok(Json(json!(
+        (0..output_count)
+            .map(|vout| {
+                let spender = outspends.get(&OutPoint::new(txid, vout as u32));
+                json!({ "spent": spender.is_some(), "txid": spender })
+            })
+            .collect::<Vec<_>>()
+    )))
+}
+
+async fn explorer_address_utxos(
+    State(state): State<ExplorerState>,
+    AxumPath(address): AxumPath<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let address = Address::<NetworkUnchecked>::from_str(&address)
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .require_network(bitcoin::Network::Regtest)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let transactions = state.transactions.lock().unwrap();
+    let outspends = state.outspends.lock().unwrap();
+    let mut outputs = Vec::new();
+    for (txid, observed) in transactions.iter() {
+        for (vout, output) in observed.transaction.output.iter().enumerate() {
+            let outpoint = OutPoint::new(*txid, vout as u32);
+            if output.script_pubkey == address.script_pubkey() && !outspends.contains_key(&outpoint)
+            {
+                outputs.push(json!({
+                    "txid": txid,
+                    "vout": vout,
+                    "value": output.value.to_sat(),
+                    "status": explorer_status(&state, observed.confirmations),
+                }));
+            }
+        }
     }
-    let vout = funding_vout(funding);
-    Ok(Json(json!(vec![
-        json!({ "spent": false });
-        vout as usize + 1
-    ])))
+    Ok(Json(json!(outputs)))
+}
+
+async fn explorer_broadcast(
+    State(state): State<ExplorerState>,
+    body: String,
+) -> Result<String, (StatusCode, String)> {
+    let transaction: Transaction = deserialize(
+        &hex::decode(body.trim()).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?,
+    )
+    .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let txid = transaction.compute_txid();
+    if let Some(existing) = state.transactions.lock().unwrap().get(&txid) {
+        if existing.transaction != transaction {
+            return Err((StatusCode::CONFLICT, "same txid has different bytes".into()));
+        }
+        return Ok(txid.to_string());
+    }
+    state.broadcasts.lock().unwrap().push(body);
+    state.observe(transaction, 0);
+    Ok(txid.to_string())
 }
 
 async fn explorer_fees() -> Json<Value> {
@@ -1079,7 +1591,14 @@ async fn explorer_package(
     State(state): State<ExplorerState>,
     Json(package): Json<Vec<String>>,
 ) -> Json<Value> {
+    let transactions: Vec<Transaction> = package
+        .iter()
+        .map(|raw| deserialize(&hex::decode(raw).unwrap()).unwrap())
+        .collect();
     state.packages.lock().unwrap().push(package);
+    for transaction in transactions {
+        state.observe(transaction, 0);
+    }
     Json(json!({ "package_msg": "success", "tx-results": {} }))
 }
 
@@ -1336,7 +1855,41 @@ async fn core_rpc(State(state): State<CoreState>, Json(request): Json<RpcRequest
                 "fees": { "base": 0.000001 }
             }])
         }
+        "gettxspendingprevout" => {
+            let requested = &request.params[0][0];
+            let outpoint = OutPoint::new(
+                requested["txid"].as_str().unwrap().parse().unwrap(),
+                requested["vout"].as_u64().unwrap() as u32,
+            );
+            let spending_txid = state.broadcasts.lock().unwrap().iter().find_map(|raw| {
+                let transaction: Transaction = deserialize(&hex::decode(raw).unwrap()).unwrap();
+                transaction
+                    .input
+                    .iter()
+                    .any(|input| input.previous_output == outpoint)
+                    .then(|| transaction.compute_txid())
+            });
+            json!([{
+                "txid": outpoint.txid,
+                "vout": outpoint.vout,
+                "spendingtxid": spending_txid,
+            }])
+        }
+        "getrawtransaction" => {
+            return Json(json!({
+                "result": Value::Null,
+                "error": { "code": -5, "message": "No such mempool transaction" },
+                "id": request.id,
+            }));
+        }
         "gettransaction" => {
+            if *state.hide_wallet_transactions.lock().unwrap() {
+                return Json(json!({
+                    "result": Value::Null,
+                    "error": { "code": -5, "message": "Invalid or non-wallet transaction id" },
+                    "id": request.id,
+                }));
+            }
             let requested = request.params[0].as_str().unwrap();
             let raw = state
                 .broadcasts
@@ -1390,10 +1943,12 @@ async fn core_rpc(State(state): State<CoreState>, Json(request): Json<RpcRequest
             let transaction: Transaction = deserialize(&hex::decode(&raw).unwrap()).unwrap();
             let txid = transaction.compute_txid();
             let output = transaction.output.first().unwrap();
-            *state.funding.lock().unwrap() = Some(Funding {
-                outpoint: OutPoint::new(txid, 0).to_string(),
-                script_hex: hex::encode(output.script_pubkey.as_bytes()),
-            });
+            if transaction.version == Version::TWO {
+                *state.funding.lock().unwrap() = Some(Funding {
+                    outpoint: OutPoint::new(txid, 0).to_string(),
+                    script_hex: hex::encode(output.script_pubkey.as_bytes()),
+                });
+            }
             state.locked_inputs.lock().unwrap().clear();
             state.broadcasts.lock().unwrap().push(raw);
             *state.in_mempool.lock().unwrap() = true;
@@ -1405,32 +1960,70 @@ async fn core_rpc(State(state): State<CoreState>, Json(request): Json<RpcRequest
             "bestblockhash": "00".repeat(32)
         }),
         "gettxout" => {
-            let outpoint = format!(
-                "{}:{}",
-                request
-                    .params
-                    .first()
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                request
-                    .params
-                    .get(1)
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default()
+            let outpoint = OutPoint::new(
+                request.params[0].as_str().unwrap().parse().unwrap(),
+                request.params[1].as_u64().unwrap() as u32,
             );
-            match state.funding.lock().unwrap().as_ref() {
-                Some(funding) if funding.outpoint == outpoint => json!({
+            let spent = state
+                .broadcasts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|raw| deserialize::<Transaction>(&hex::decode(raw).unwrap()).unwrap())
+                .chain(
+                    state
+                        .confirmed_transactions
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .cloned(),
+                )
+                .any(|transaction| {
+                    transaction
+                        .input
+                        .iter()
+                        .any(|input| input.previous_output == outpoint)
+                });
+            if spent {
+                return Json(json!({
+                    "result": Value::Null,
+                    "error": Value::Null,
+                    "id": request.id,
+                }));
+            }
+            if let Some(transaction) = state
+                .confirmed_transactions
+                .lock()
+                .unwrap()
+                .get(&outpoint.txid)
+            {
+                let output = &transaction.output[outpoint.vout as usize];
+                json!({
                     "bestblock": "00".repeat(32),
                     "confirmations": *state.confirmations.lock().unwrap(),
-                    "value": 0.001,
+                    "value": output.value.to_btc(),
                     "scriptPubKey": {
                         "asm": "",
-                        "hex": funding.script_hex,
+                        "hex": hex::encode(output.script_pubkey.as_bytes()),
                         "type": "witness_v1_taproot"
                     },
                     "coinbase": false
-                }),
-                _ => Value::Null,
+                })
+            } else {
+                match state.funding.lock().unwrap().as_ref() {
+                    Some(funding) if funding.outpoint == outpoint.to_string() => json!({
+                        "bestblock": "00".repeat(32),
+                        "confirmations": *state.confirmations.lock().unwrap(),
+                        "value": 0.001,
+                        "scriptPubKey": {
+                            "asm": "",
+                            "hex": funding.script_hex,
+                            "type": "witness_v1_taproot"
+                        },
+                        "coinbase": false
+                    }),
+                    _ => Value::Null,
+                }
             }
         }
         method => {

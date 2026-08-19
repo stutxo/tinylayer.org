@@ -4,9 +4,11 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY enclave/Cargo.toml enclave/Cargo.toml
 COPY client/Cargo.toml client/Cargo.toml
+COPY wallet-core/Cargo.toml wallet-core/Cargo.toml
 COPY wallet/Cargo.toml wallet/Cargo.toml
 COPY enclave/src enclave/src
 COPY client/src client/src
+COPY wallet-core/src wallet-core/src
 COPY wallet/src wallet/src
 RUN cargo build --locked --release -p tinylayer-enclave --features workload --bin tinylayer-workload
 

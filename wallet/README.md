@@ -1,8 +1,9 @@
 # Tinylayer wallet
 
 `tinylayer-wallet` is the native command-line wallet and test harness for
-Tinylayer. It manages registration, safe funding construction, recovery
-transactions, off-chain ownership transfers, receipts, and on-chain exits.
+Tinylayer. It manages an encrypted P2TR deposit key, safe funding construction,
+recovery transactions, off-chain ownership transfers, receipts, and on-chain
+exits.
 
 The current wallet supports Regtest and Mutinynet. Mainnet is deliberately
 unavailable. The local walkthrough below uses unsafe plaintext transport and
@@ -326,8 +327,8 @@ Important operational consequences:
   relative delay.
 - `coin fund` never broadcasts until a valid Alice recovery and its withdrawal
   secret are in the durably synced wallet state. Signer loss before that point
-  leaves the Core wallet's source funds unbroadcast; signer loss afterward
-  leaves Alice with a unilateral recovery.
+  leaves the selected source funds unbroadcast; signer loss afterward leaves
+  Alice with a unilateral recovery.
 - Confirm that `coin fund` or `transfer accept` has durably completed and
   that `coin recovery` can export the expected transaction before relying on
   it.
@@ -354,7 +355,7 @@ Plaintext transport requires an HTTP loopback URL. Bitcoin Core RPC is also
 Regtest-only and requires a numeric loopback URL plus a private, non-symlink
 cookie file. Core configuration also requires the name of a loaded,
 private-key-enabled wallet. Production and debug attestation require all three
-PCR values.
+PCR values. Production mode rejects an all-zero debug measurement in any PCR.
 
 The complete image build, Enclavia deployment, PCR recording, connection, and
 lifecycle procedure is in [`enclave/README.md`](../enclave/). In
@@ -404,12 +405,48 @@ It reads `config.json` directly and does not decrypt or authenticate wallet
 state; `coin register` opens the authenticated wallet and performs its own
 attested connection.
 
-The current safe funding builder is intentionally Bitcoin Core-only and Core
-RPC is restricted to Regtest, so this revision cannot originate a new
-Mutinynet coin. Explorer-backed wallets can verify and receive an already
-funded coin, verify receipts, and submit exits. A future PSBT import flow can
-restore production origination without weakening the recovery-before-broadcast
-invariant.
+Show the wallet's stable deposit address, fund it with confirmed Mutinynet sats,
+then register and fund one Tinylayer coin:
+
+```bash
+WALLET=./target/release/tinylayer-wallet
+DATA_DIR=/secure/path/alice
+PASSWORD=/secure/path/password
+
+"$WALLET" --data-dir "$DATA_DIR" --password-file "$PASSWORD" \
+  coin deposit-address
+
+# Send one confirmed UTXO that covers the coin amount, funding fee, and a
+# non-dust change output to the displayed address.
+
+"$WALLET" --data-dir "$DATA_DIR" --password-file "$PASSWORD" \
+  coin register
+
+"$WALLET" --data-dir "$DATA_DIR" --password-file "$PASSWORD" \
+  coin fund --amount-sat 100000 --max-fee-sat 1000
+```
+
+The deposit secret is generated locally, exists only inside encrypted
+`wallet.enc`, and is separate from the coin's transferable client key and each
+owner's withdrawal key. `coin fund` selects the largest confirmed non-coinbase
+deposit output, signs one exact non-RBF P2TR transaction locally, durably
+secures Alice's recovery, and only then submits those exact bytes to Esplora.
+
+After funding, sweep confirmed deposit change and other unreserved deposits:
+
+```bash
+"$WALLET" --data-dir "$DATA_DIR" --password-file "$PASSWORD" \
+  coin source-sweep \
+  --destination tb1p... \
+  --fee-rate 1 \
+  --max-fee-sat 1000
+```
+
+Each sweep selects up to 100 of the largest outputs and excludes every input
+reserved by the saved funding journal. Its exact inputs and transaction are
+persisted before submission, so retries never silently select new coins. Once a
+sweep reaches the wallet's minimum-confirmation policy, rerun the command to
+sweep another batch or newer deposits.
 
 ### Chain backends
 
@@ -419,7 +456,7 @@ Core RPC is restricted to a numeric loopback HTTP base URL and a private
 regular cookie file. The wallet name is encoded into the wallet RPC endpoint;
 do not include `/wallet/...` in `--bitcoin-rpc-url`.
 
-`coin fund` requires the Core backend. It uses `walletcreatefundedpsbt`,
+With Bitcoin Core, `coin fund` uses `walletcreatefundedpsbt`,
 `walletprocesspsbt`, `finalizepsbt`, `testmempoolaccept`, and
 `sendrawtransaction`. It rejects legacy or otherwise non-native-SegWit inputs,
 RBF-signalling sequences, unconfirmed source inputs, an incomplete PSBT,
@@ -427,16 +464,34 @@ multiple Tinylayer outputs, a changed amount, a fee above `--max-fee-sat`, or a
 returned txid that differs from the recovery outpoint. Selected inputs are
 persistently locked before enclave signing. Use one dedicated Core wallet per
 originating Tinylayer wallet and do not spend its selected inputs concurrently
-through another RPC client.
+through another RPC client. Receiver verification uses the confirmed
+`gettxout` proof and therefore does not require `txindex` or access to the
+sender's funding wallet. Armed exit retries can likewise prove a confirmed
+parent or child through its expected unspent output when raw history is not
+indexed.
+
+With Esplora, `coin fund` spends the encrypted wallet's local deposit key. The
+backend is never asked to hold or sign with private keys. Before trusting an
+observation, the wallet fetches raw transaction bytes, checks txids and exact
+outputs, verifies confirmed block hashes against the current chain, and obtains
+the exact spending txid for spent outputs. On every connection it also requires
+the explorer's genesis to match the configured network and pins a
+Mutinynet-specific checkpoint so another Signet cannot be substituted. HTTP
+responses are capped at 16 MiB, and deposit discovery performs detailed checks
+on at most the 256 highest-value confirmed candidates per sweep.
 
 Explorer URLs must use HTTPS unless the host is loopback, and cannot contain
 credentials, a query, or a fragment. A custom explorer must support the
-Esplora transaction, outspend, block-height, and tip endpoints used for
-funding verification. Explorer-backed exits always require package submission:
+Esplora address-UTXO, raw transaction, transaction status, individual outspend,
+block-height, tip, fee, and broadcast endpoints. Explorer-backed exits use
+package submission:
 
 ```text
-POST /v1/txs/package
+POST /txs/package
 ```
+
+The wallet falls back to `POST /v1/txs/package` when the preferred route returns
+HTTP 404.
 
 When `coin exit` does not receive `--fee-rate`, an explorer must also support
 `GET /v1/fees/recommended`; the wallet rounds its `fastestFee` response up to a
@@ -445,17 +500,23 @@ sat/vB when no explicit rate is supplied.
 
 Package submission must accept a JSON array containing the parent and child
 transaction hex and return JSON with `"package_msg":"success"`.
+Ordinary transaction submission uses `POST /tx` with raw hex as `text/plain`.
+Success is not inferred from the HTTP response alone: the wallet must retrieve
+the same full transaction bytes afterward. This also reconciles timeouts and
+already-known transactions without relying only on a witness-independent txid.
 
 ## Command summary
 
 ```text
 tinylayer-wallet --data-dir DIR [--password-file FILE] [--json] init ...
 tinylayer-wallet --data-dir DIR enclave verify
+tinylayer-wallet --data-dir DIR coin deposit-address
 tinylayer-wallet --data-dir DIR coin register
 tinylayer-wallet --data-dir DIR coin fund --amount-sat SAT --max-fee-sat SAT [--delay-blocks BLOCKS] [--fee-rate SAT_VB]
 tinylayer-wallet --data-dir DIR coin status
 tinylayer-wallet --data-dir DIR coin sign --request FILE --output FILE
 tinylayer-wallet --data-dir DIR coin recovery --output FILE
+tinylayer-wallet --data-dir DIR coin source-sweep --destination ADDRESS --max-fee-sat SAT [--fee-rate SAT_VB]
 tinylayer-wallet --data-dir DIR coin exit --destination ADDRESS --max-fee-sat SAT [--dry-run]
 tinylayer-wallet --data-dir DIR transfer request ... --output FILE
 tinylayer-wallet --data-dir DIR transfer accept --request FILE --package FILE
@@ -474,7 +535,8 @@ human-readable text with a nonzero exit code.
 Each data directory contains:
 
 - `config.json`: network, enclave, chain backend, and confirmation policy.
-- `wallet.enc`: Argon2id/XChaCha20-Poly1305 encrypted wallet state.
+- `wallet.enc`: Argon2id/XChaCha20-Poly1305 encrypted wallet state, local
+  deposit secret, and exit/sweep journals.
 - `.lock`: prevents concurrent wallet processes from modifying the same state.
 
 The password is read from `--password-file`, then
@@ -489,13 +551,18 @@ and do not modify its contents manually.
 Each wallet directory currently holds at most one coin. Use separate data
 directories for Alice, Bob, and every other independent wallet.
 
-Wallet state and transfer artifacts currently use file format version 4 and
-have no migration command. Version 3 absolute-locktime wallets and artifacts
-are intentionally incompatible. Many payload structs reject unknown fields, but
-forward-compatible extension is not guaranteed for every tagged journal
-variant. Treat transfer requests, encrypted packages, and receipts as opaque
-artifacts for the same wallet version rather than a stable cross-version
-interoperability contract.
+Wallet protocol state, native encrypted storage, and transfer artifacts use
+format version 1. Local-only keys and submission journals remain in native
+storage and never enter transfer packages. There are no older supported wallet
+formats or compatibility decoders. Treat transfer requests, encrypted packages,
+and receipts as opaque version-1 artifacts.
+
+Input and artifact files are limited to 16 MiB, encrypted transfer ciphertext
+is limited to slightly under 8 MiB, and `wallet.enc` is limited to 64 MiB to
+cover its hex-encoded encrypted representation. Accepted-package replay stores
+a fixed-size fingerprint of the envelope, and a transferred sender retains only
+its own recovery outside the replayable encrypted package; these bounds ensure
+that every permitted package has a persistable post-sign state.
 
 Wallet configuration, transfer requests, encrypted transfer payloads, and
 receipts carry protocol version 1, the first supported Tinylayer protocol. The
@@ -514,7 +581,14 @@ crashes, rerun the same operation. Registration has no operation-specific
 arguments. For transfer signing, supply a request file with the exact same
 content; the file and output paths may differ. The wallet queries live status
 and, if the count advanced, retries the exact journaled request against the
-enclave's latest-response cache.
+enclave's latest-response cache. Retrying transfer acceptance requires both the
+same request and the same encrypted-envelope fields; JSON whitespace and object
+ordering may differ, but reusing an accepted request ID with different envelope
+content fails closed.
+
+Before a transfer signing request reaches the enclave, the wallet sizes the
+prospective package with a maximum-width recovery witness and handoff. A history
+that cannot fit the artifact limit is rejected before signer state can advance.
 
 For funding, rerun `coin fund` with exactly the same amount, delay, fee rate,
 and maximum fee. Its persisted stages are `Prepared`, `RecoverySecured`, and
@@ -523,9 +597,21 @@ that durable transition can safely resume broadcasting, and a lost
 `sendrawtransaction` response is reconciled against the exact wallet
 transaction bytes before any retry. An evicted unconfirmed transaction is
 rebroadcast byte-for-byte; the transaction is never rebuilt or fee-bumped.
-If the enclave response itself was already durably journaled, the wallet can
-verify its signature, finish Alice's recovery, and broadcast without reconnecting
-to the signer.
+If the enclave response itself was already durably journaled, the wallet still
+checks live status from the same signer before applying its handoff and securing
+Alice's recovery.
+
+For `coin source-sweep`, rerun with the same destination, fee rate, and maximum
+fee. For `coin exit` with either chain backend, rerun with the same destination
+and maximum fee; omit the fee rate again or provide the exact saved value. Both
+operations persist transactions in `Prepared`, `SubmissionArmed`, and
+`Observed` stages. Submission occurs only after `SubmissionArmed` is durable.
+Before submission is armed, rerunning with a different policy safely replaces a
+`Prepared` sweep or exit; after arming, retries must use the saved policy and
+exact transaction.
+If an observed transaction is evicted, the wallet re-arms and submits the same
+bytes. An exit with an observed parent and missing child submits only the exact
+saved child.
 
 Core coin selection initially locks inputs in memory. The wallet journals the
 finalized transaction before upgrading those locks to persistent storage and
@@ -538,10 +624,9 @@ explicitly unlock those source outputs before abandoning that registration.
 Do not delete `wallet.enc`, create a replacement transfer request, or manually
 edit the journal to recover from an uncertain result. Before a response is
 saved, only the exact latest request accepted by the enclave is retryable and
-reconciliation requires the same enclave process. Transfer completion also
-requires live status. If that process restarted, its signing key and retry
-cache are gone; only a saved initial-funding response or an already secured
-recovery can complete without it.
+reconciliation requires the same enclave process. Funding and transfer
+completion also require live status. If that process restarted, its signing key
+and retry cache are gone; only an already secured recovery remains usable.
 
 Transfer JSON outputs may already exist only when their content exactly matches
 the artifact being written; the wallet refuses to replace different content.
@@ -551,10 +636,10 @@ an existing file contains the same transaction.
 
 ### Backup and restore
 
-There is no tested import, restore, reset, password-change, or migration
-command. `config.json` and `wallet.enc` form one authenticated pair and must be
-backed up together while no wallet process is running. Preserve the data
-directory's private permissions and do not restore through symlinks.
+There is no tested import, restore, reset, or password-change command.
+`config.json` and `wallet.enc` form one authenticated pair and must be backed up
+together while no wallet process is running. Preserve the data directory's
+private permissions and do not restore through symlinks.
 
 Preserve the wallet password or its mode-0600 password file separately from
 the encrypted-state backup. There is no password recovery path if both are
@@ -595,8 +680,8 @@ exercise Nitro hardware.
 ## Current limitations
 
 - Mainnet is not supported.
-- Safe funding origination currently requires a Regtest Bitcoin Core wallet;
-  there is not yet a PSBT import flow for Mutinynet or hardware wallets.
+- Explorer funding currently uses one locally signed confirmed P2TR input; it
+  does not combine deposits for one coin or support hardware wallets.
 - The workload stores signing state only in memory; restarting it loses every
   registered coin and retry record.
 - A wallet directory holds one coin and has no reset or import command.
@@ -607,4 +692,4 @@ exercise Nitro hardware.
   confidentiality.
 - The workload has no application authentication, rate limiting, metrics, or
   state-listing endpoint.
-- Wallet backups have no supported rollback, import, or migration workflow.
+- Wallet backups have no supported rollback or import workflow.

@@ -151,8 +151,8 @@ Operational consequences:
 - `coin fund` finalizes and journals the funding transaction without
   broadcasting it, obtains and durably stores Alice's recovery, and only then
   broadcasts the exact funding bytes. Signer loss before recovery completion
-  leaves the source funds in the configured Core wallet; signer loss after
-  recovery completion leaves Alice with a unilateral recovery.
+  leaves the selected source funds unbroadcast; signer loss after recovery
+  completion leaves Alice with a unilateral recovery.
 - After signer loss, owners can only use recoveries already stored by their
   wallets once those transactions become final. The enclave state cannot be
   reconstructed.
@@ -482,9 +482,10 @@ DATA_DIR="$HOME/.local/share/tinylayer/alice"
 ```
 
 Mutinynet uses `https://mutinynet.com/api` as its default chain backend.
-`init` validates local policy, PCR formatting, and chain configuration, but it
-does not parse or connect to the production enclave endpoint. Verify the
-configured attested connection before registering a coin:
+`init` validates local policy, PCR formatting, rejects all-zero debug
+measurements in production mode, and validates chain configuration, but it does
+not parse or connect to the production enclave endpoint. Verify the configured
+attested connection before registering a coin:
 
 ```bash
 "$WALLET" \
@@ -496,9 +497,10 @@ configured attested connection before registering a coin:
 `enclave verify` reads `config.json` without decrypting wallet state and checks
 attestation plus the health endpoint. It is a preflight rather than wallet-state
 authentication; `coin register` opens the authenticated wallet and repeats the
-attested connection. Do not prepare funding until registration returns a result
-that the wallet has verified against the pinned identity. Continue with the
-[wallet guide](../wallet/).
+attested connection. Use `coin deposit-address` to obtain the encrypted wallet's
+local Mutinynet P2TR source address. Do not run `coin fund` until registration
+returns a result that the wallet has verified against the pinned identity and a
+sufficient deposit is confirmed. Continue with the [wallet guide](../wallet/).
 
 ### Debug Enclavia wallet
 

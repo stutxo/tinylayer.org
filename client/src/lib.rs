@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "remote")]
 use std::fmt;
 
 use bitcoin::{
@@ -15,6 +16,7 @@ use bitcoin::{
     taproot::{ControlBlock, LeafVersion, TapLeafHash, TaprootBuilder, TaprootSpendInfo},
     transaction::Version,
 };
+#[cfg(feature = "remote")]
 use enclavia::{Client as EnclaviaSdkClient, Pcrs};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -23,6 +25,7 @@ pub use tinylayer_enclave::{
     Capability, CoinId, CoinStatus, HandoffToken, INITIAL_HANDOFF, PROTOCOL_VERSION,
     RegisterRequest, SignRequest, SignResponse, authorization, capability_hash,
 };
+#[cfg(feature = "remote")]
 use tinylayer_enclave::{Request, Response};
 
 pub const DELAY_STEP: u32 = 10;
@@ -130,6 +133,31 @@ pub struct PreparedRecovery {
     delay_blocks: u32,
 }
 
+impl PreparedRecovery {
+    /// Returns a structurally complete recovery with maximum-width witness
+    /// bytes for conservative serialized-size checks. It is not signed.
+    pub fn recovery_serialization_template(&self) -> Result<SignedRecovery, Error> {
+        let mut transaction = self.transaction.clone();
+        let input = transaction
+            .input
+            .first_mut()
+            .ok_or(Error::TransactionMismatch)?;
+        input.witness.push([0xff; 64]);
+        input.witness.push([0xff; 64]);
+        input
+            .witness
+            .push(funding_tapscript(&self.metadata.keys).as_bytes());
+        input
+            .witness
+            .push(funding_control_block(&self.metadata.keys).serialize());
+        Ok(SignedRecovery {
+            transaction,
+            withdrawal_xonly_pubkey: self.withdrawal_xonly_pubkey,
+            delay_blocks: self.delay_blocks,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum Error {
     #[error("client state protocol version does not match")]
@@ -170,17 +198,21 @@ pub enum Error {
     WithdrawalKeyMismatch,
 }
 
+#[cfg(feature = "remote")]
 #[derive(Debug)]
 pub enum RemoteError {
     Enclavia(Box<enclavia::Error>),
+    Configuration(String),
     Protocol { status: u16, message: String },
     Json(serde_json::Error),
 }
 
+#[cfg(feature = "remote")]
 impl fmt::Display for RemoteError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Enclavia(error) => write!(f, "Enclavia connection failed: {error}"),
+            Self::Configuration(message) => write!(f, "invalid enclave configuration: {message}"),
             Self::Protocol { status, message } => {
                 write!(f, "enclave returned HTTP {status}: {message}")
             }
@@ -189,27 +221,33 @@ impl fmt::Display for RemoteError {
     }
 }
 
+#[cfg(feature = "remote")]
 impl std::error::Error for RemoteError {}
 
+#[cfg(feature = "remote")]
 impl From<enclavia::Error> for RemoteError {
     fn from(error: enclavia::Error) -> Self {
         Self::Enclavia(Box::new(error))
     }
 }
 
+#[cfg(feature = "remote")]
 impl From<serde_json::Error> for RemoteError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
     }
 }
 
+#[cfg(feature = "remote")]
 #[derive(Clone)]
 pub struct RemoteEnclave {
     client: EnclaviaSdkClient,
 }
 
+#[cfg(feature = "remote")]
 impl RemoteEnclave {
     pub async fn connect(url: &str, pcrs: Pcrs) -> Result<Self, RemoteError> {
+        validate_production_pcrs(&pcrs)?;
         Ok(Self {
             client: EnclaviaSdkClient::connect(url, pcrs).await?,
         })
@@ -256,6 +294,23 @@ impl RemoteEnclave {
         ensure_success(response.status(), response.bytes())?;
         Ok(serde_json::from_slice(response.bytes())?)
     }
+}
+
+#[cfg(feature = "remote")]
+pub fn validate_production_pcrs(pcrs: &Pcrs) -> Result<(), RemoteError> {
+    for (index, pcr) in [&pcrs.pcr0, &pcrs.pcr1, &pcrs.pcr2].into_iter().enumerate() {
+        if pcr.len() != 48 {
+            return Err(RemoteError::Configuration(format!(
+                "PCR{index} must be a 48-byte SHA-384 measurement"
+            )));
+        }
+        if pcr.iter().all(|byte| *byte == 0) {
+            return Err(RemoteError::Configuration(format!(
+                "PCR{index} cannot be the all-zero debug measurement"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn prepare_registration(
@@ -851,6 +906,7 @@ fn require_future_delay(funding_confirmations: u32, delay_blocks: u32) -> Result
     Ok(())
 }
 
+#[cfg(feature = "remote")]
 fn ensure_success(status: u16, body: &[u8]) -> Result<(), RemoteError> {
     if (200..300).contains(&status) {
         return Ok(());
@@ -861,6 +917,7 @@ fn ensure_success(status: u16, body: &[u8]) -> Result<(), RemoteError> {
     })
 }
 
+#[cfg(feature = "remote")]
 fn unexpected_response() -> RemoteError {
     RemoteError::Protocol {
         status: 500,

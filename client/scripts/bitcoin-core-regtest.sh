@@ -39,10 +39,15 @@ WORKLOAD_BIN="$WORKSPACE_ROOT/target/debug/tinylayer-workload"
 "$WORKLOAD_BIN" >"$WORKLOAD_LOG" 2>&1 &
 workload_pid=$!
 for _ in {1..100}; do
-  if curl --silent --fail http://127.0.0.1:8080/health >/dev/null; then
-    break
-  fi
   if ! kill -0 "$workload_pid" 2>/dev/null; then
+    cat "$WORKLOAD_LOG" >&2
+    exit 1
+  fi
+  if curl --silent --fail http://127.0.0.1:8080/health >/dev/null; then
+    sleep 0.05
+    if kill -0 "$workload_pid" 2>/dev/null; then
+      break
+    fi
     cat "$WORKLOAD_LOG" >&2
     exit 1
   fi
@@ -162,8 +167,20 @@ printf 'Alice maturity at %s confirmations: ' "$alice_delay"
 "${RPC[@]}" testmempoolaccept "[\"$alice_parent\",\"$alice_child\"]" | \
   jq -e 'select(length == 2 and .[0].allowed == false and .[0]["reject-reason"] == "min relay fee not met" and .[1]["reject-reason"] == null) | map({txid, allowed, reject_reason: .["reject-reason"]})'
 
+exit_error="$TEST_ROOT/exit-error.json"
+for failpoint in after_exit_prepared after_exit_armed after_exit_submission; do
+  if ENCLAVIA_WALLET_TEST_FAILPOINT="$failpoint" \
+    "$WALLET_BIN" --data-dir "$CAROL" --password-file "$PASSWORD_FILE" --json \
+      coin exit --destination "$exit_address" --fee-rate 2 --max-fee-sat 10000 \
+      >/dev/null 2>"$exit_error"; then
+    printf 'Expected exit failpoint %s to stop the wallet\n' "$failpoint" >&2
+    exit 1
+  fi
+  jq -e --arg failpoint "$failpoint" \
+    '.error == ("stopped at test failpoint " + $failpoint)' "$exit_error" >/dev/null
+done
 submitted=$(wallet "$CAROL" coin exit --destination "$exit_address" --fee-rate 2 --max-fee-sat 10000)
-jq -e 'select(.status == "package_submitted")' <<<"$submitted" >/dev/null
+jq -e 'select(.status == "package_observed")' <<<"$submitted" >/dev/null
 withdrawal_txid=$(jq -er '.exit_txid' <<<"$submitted")
 carol_recovery_txid=$("${RPC_BASE[@]}" decoderawtransaction "$carol_tx" | jq -er '.txid')
 [[ $(jq -er '.recovery_txid' <<<"$submitted") == "$carol_recovery_txid" ]]
@@ -172,6 +189,9 @@ carol_recovery_txid=$("${RPC_BASE[@]}" decoderawtransaction "$carol_tx" | jq -er
   jq -e 'select(.confirmations >= 1) | {confirmations}' >/dev/null
 "${RPC_BASE[@]}" decoderawtransaction "$("${RPC[@]}" gettransaction "$withdrawal_txid" | jq -er '.hex')" | \
   jq -e --arg addr "$exit_address" \
-    'select(any(.vout[]; .scriptPubKey.address == $addr)) | {txid}' >/dev/null
+  'select(any(.vout[]; .scriptPubKey.address == $addr)) | {txid}' >/dev/null
+wallet "$CAROL" coin exit --destination "$exit_address" --fee-rate 2 --max-fee-sat 10000 | \
+  jq -e --arg txid "$withdrawal_txid" \
+  'select(.status == "package_observed" and .exit_txid == $txid)' >/dev/null
 echo "Confirmed Carol exit: $withdrawal_txid"
 echo "Only funding $fund_txid and final exit $withdrawal_txid were required on-chain."

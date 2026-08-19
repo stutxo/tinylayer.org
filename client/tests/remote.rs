@@ -256,6 +256,24 @@ async fn production_connection_rejects_synthetic_attestation() {
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn production_connection_rejects_debug_and_non_sha384_pcrs_before_networking() {
+    let zero = "00".repeat(48);
+    let nonzero = "11".repeat(48);
+    let debug = enclavia::Pcrs::from_hex(&zero, &nonzero, &nonzero).unwrap();
+    assert!(matches!(
+        RemoteEnclave::connect("wss://127.0.0.1:1", debug).await,
+        Err(RemoteError::Configuration(_))
+    ));
+
+    let short = "22".repeat(32);
+    let wrong_length = enclavia::Pcrs::from_hex(&short, &nonzero, &nonzero).unwrap();
+    assert!(matches!(
+        RemoteEnclave::connect("wss://127.0.0.1:1", wrong_length).await,
+        Err(RemoteError::Configuration(_))
+    ));
+}
+
 #[test]
 fn remote_error_conversions_preserve_context() {
     let enclavia = RemoteError::from(enclavia::Error::InvalidUrl("bad URL".into()));

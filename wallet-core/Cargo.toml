@@ -1,0 +1,25 @@
+[package]
+name = "tinylayer-wallet-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "I/O-independent native Tinylayer wallet state and verification"
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+bitcoin.workspace = true
+chacha20poly1305.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tinylayer-client = { path = "../client", default-features = false }
+zeroize.workspace = true
+
+[dev-dependencies]
+tinylayer-enclave = { path = "../enclave" }

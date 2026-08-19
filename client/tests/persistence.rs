@@ -34,8 +34,13 @@ fn prepared_recovery_round_trips_without_serializing_secret_or_derived_taproot_d
 
     let restored: PreparedRecovery = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(restored, prepared);
+    let maximum_recovery_size =
+        serde_json::to_vec(&restored.recovery_serialization_template().unwrap())
+            .unwrap()
+            .len();
     let response = opened.enclave.sign(request.clone()).unwrap();
     let recovery = complete_recovery(&request, &response, restored, opened.client_secret).unwrap();
+    assert!(serde_json::to_vec(&recovery).unwrap().len() <= maximum_recovery_size);
     verify_recovery(&opened.metadata, &recovery).unwrap();
 }
 

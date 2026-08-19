@@ -29,6 +29,7 @@ Run before submitting a change:
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --all-features
+cargo test --locked -p tinylayer-client --no-default-features --all-targets
 ```
 
 The workload binary test starts the real workload on `0.0.0.0:8080`. Stop any
@@ -82,12 +83,11 @@ client; the enclave intentionally signs an opaque digest.
 
 ### Wallet formats
 
-Wallet state and transfer artifacts currently use `FILE_FORMAT_VERSION = 4`.
-Many payload structs reject unknown fields, while some tagged journal variants
-do not; do not assume a new field is safely ignored everywhere. A serialized
-format change must either preserve exact compatibility or increment the format
-version and document migration or the lack of one. Coordinate transfer
-encryption domain tags and tests with any format change.
+Protocol wallet state, native encrypted storage, and transfer artifacts use
+format version 1. Persisted payloads reject unknown fields; do not assume a new
+field is safely ignored. A serialized format change must increment the relevant
+format. Keep transfer encryption domain tags and exact-schema tests coordinated
+with any format change.
 
 ### Dependencies and images
 

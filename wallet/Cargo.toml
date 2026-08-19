@@ -9,23 +9,20 @@ description = "Native wallet and test harness for Tinylayer"
 
 [dependencies]
 anyhow.workspace = true
-argon2.workspace = true
 bitcoin.workspace = true
 bitcoincore-rpc.workspace = true
-chacha20poly1305.workspace = true
 clap.workspace = true
 enclavia.workspace = true
 fs2.workspace = true
 hex.workspace = true
-hkdf.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 tinylayer-client = { path = "../client" }
 tinylayer-enclave = { path = "../enclave" }
+tinylayer-wallet-core = { path = "../wallet-core" }
 tokio.workspace = true
 zeroize.workspace = true
 

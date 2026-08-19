@@ -1,5 +1,5 @@
 [workspace]
-members = ["enclave", "client", "wallet"]
+members = ["enclave", "client", "wallet-core", "wallet"]
 resolver = "3"
 
 [workspace.package]

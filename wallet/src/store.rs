@@ -6,26 +6,20 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, ensure};
-use argon2::{Algorithm, Argon2, Params, Version};
-use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
-    aead::{Aead as _, KeyInit as _, Payload},
-};
 use fs2::FileExt as _;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sha2::{Digest as _, Sha256};
+use serde::{Serialize, de::DeserializeOwned};
 use zeroize::Zeroizing;
 
-use crate::model::{Config, FILE_FORMAT_VERSION, WalletState};
+use crate::model::{Config, NativeWalletState, WalletState};
+#[cfg(test)]
+use tinylayer_wallet_core::MAX_TRANSFER_CIPHERTEXT_SIZE;
+use tinylayer_wallet_core::{open_encrypted_json, seal_encrypted_json, wallet_state_aad};
 
 const CONFIG_FILE: &str = "config.json";
 const STATE_FILE: &str = "wallet.enc";
 const LOCK_FILE: &str = ".lock";
-const STATE_AAD: &[u8] = b"tinylayer-wallet-state-v4";
 const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
-const KDF_MEMORY_KIB: u32 = 19_456;
-const KDF_ITERATIONS: u32 = 2;
-const KDF_PARALLELISM: u32 = 1;
+const MAX_STATE_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
 pub struct WalletStore {
     directory: PathBuf,
@@ -33,26 +27,6 @@ pub struct WalletStore {
     config: Config,
     aad: Vec<u8>,
     _lock: File,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct EncryptedState {
-    format_version: u32,
-    kdf: KdfParameters,
-    cipher: String,
-    nonce: String,
-    ciphertext: String,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct KdfParameters {
-    algorithm: String,
-    memory_kib: u32,
-    iterations: u32,
-    parallelism: u32,
-    salt: String,
 }
 
 impl WalletStore {
@@ -76,7 +50,7 @@ impl WalletStore {
             aad: state_aad(config)?,
             _lock: lock,
         };
-        store.save(&WalletState::empty())?;
+        store.save_native(&NativeWalletState::new(WalletState::empty()))?;
         write_json_atomic(&directory.join(CONFIG_FILE), config)?;
         Ok(())
     }
@@ -101,83 +75,49 @@ impl WalletStore {
     }
 
     pub fn load(&self) -> Result<WalletState> {
-        let encrypted: EncryptedState = read_json_path(&self.directory.join(STATE_FILE))?;
-        ensure!(
-            encrypted.format_version == FILE_FORMAT_VERSION,
-            "unsupported encrypted wallet version {}",
-            encrypted.format_version
-        );
-        ensure!(
-            encrypted.kdf.algorithm == "argon2id",
-            "unsupported wallet KDF"
-        );
-        ensure!(
-            encrypted.cipher == "xchacha20poly1305",
-            "unsupported wallet cipher"
-        );
-        validate_kdf(&encrypted.kdf)?;
-        let salt = decode_hex("wallet salt", &encrypted.kdf.salt)?;
-        ensure!(salt.len() == 16, "invalid wallet salt length");
-        let nonce = decode_hex("wallet nonce", &encrypted.nonce)?;
-        ensure!(nonce.len() == 24, "invalid wallet nonce length");
-        let ciphertext = decode_hex("wallet ciphertext", &encrypted.ciphertext)?;
-        let key = derive_key(&self.password, &encrypted.kdf, &salt)?;
-        let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
-            .map_err(|_| anyhow::anyhow!("invalid wallet encryption key"))?;
-        let plaintext = Zeroizing::new(
-            cipher
-                .decrypt(
-                    XNonce::from_slice(&nonce),
-                    Payload {
-                        msg: &ciphertext,
-                        aad: &self.aad,
-                    },
-                )
-                .map_err(|_| {
-                    anyhow::anyhow!("wallet password is incorrect or state is corrupted")
-                })?,
-        );
-        let state: WalletState = serde_json::from_slice(plaintext.as_slice())
-            .context("decrypted wallet state is invalid")?;
-        state.validate_version()?;
+        Ok(self.load_native()?.wallet)
+    }
+
+    pub fn load_native(&self) -> Result<NativeWalletState> {
+        let bytes = read_state_limited(File::open(self.directory.join(STATE_FILE))?)?;
+        let state: NativeWalletState =
+            open_encrypted_json(&bytes, self.password.as_str(), &self.aad)?;
+        state.validate(self.config.network)?;
         Ok(state)
     }
 
     pub fn save(&self, state: &WalletState) -> Result<()> {
         state.validate_version()?;
-        let plaintext = Zeroizing::new(serde_json::to_vec(state)?);
-        let salt: [u8; 16] = rand::random();
-        let nonce: [u8; 24] = rand::random();
-        let kdf = KdfParameters {
-            algorithm: "argon2id".into(),
-            memory_kib: KDF_MEMORY_KIB,
-            iterations: KDF_ITERATIONS,
-            parallelism: KDF_PARALLELISM,
-            salt: hex::encode(salt),
+        let native = self.load_native()?;
+        let value = NativeWalletStateRef {
+            format_version: native.format_version,
+            funding_secret: &native.funding_secret,
+            wallet: state,
+            exit: native.exit.as_ref(),
+            source_sweep: native.source_sweep.as_ref(),
         };
-        let key = derive_key(&self.password, &kdf, &salt)?;
-        let cipher = XChaCha20Poly1305::new_from_slice(key.as_ref())
-            .map_err(|_| anyhow::anyhow!("invalid wallet encryption key"))?;
-        let ciphertext = cipher
-            .encrypt(
-                XNonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext.as_slice(),
-                    aad: &self.aad,
-                },
-            )
-            .map_err(|_| anyhow::anyhow!("failed to encrypt wallet state"))?;
-        write_json_atomic(
-            &self.directory.join(STATE_FILE),
-            &EncryptedState {
-                format_version: FILE_FORMAT_VERSION,
-                kdf,
-                cipher: "xchacha20poly1305".into(),
-                nonce: hex::encode(nonce),
-                ciphertext: hex::encode(ciphertext),
-            },
-        )
+        let bytes = seal_encrypted_json(&value, self.password.as_str(), &self.aad)?;
+        write_state_bytes_atomic(&self.directory.join(STATE_FILE), &bytes)
     }
+
+    pub fn save_native(&self, state: &NativeWalletState) -> Result<()> {
+        state.validate(self.config.network)?;
+        self.write_native(state)
+    }
+
+    fn write_native(&self, state: &NativeWalletState) -> Result<()> {
+        let bytes = seal_encrypted_json(state, self.password.as_str(), &self.aad)?;
+        write_state_bytes_atomic(&self.directory.join(STATE_FILE), &bytes)
+    }
+}
+
+#[derive(Serialize)]
+struct NativeWalletStateRef<'a> {
+    format_version: u32,
+    funding_secret: &'a bitcoin::secp256k1::SecretKey,
+    wallet: &'a WalletState,
+    exit: Option<&'a tinylayer_wallet_core::ExitJournal>,
+    source_sweep: Option<&'a tinylayer_wallet_core::SourceSweepJournal>,
 }
 
 pub fn load_config(directory: &Path) -> Result<Config> {
@@ -230,26 +170,31 @@ pub fn read_json_source<T: DeserializeOwned>(path: &Path) -> Result<T> {
 }
 
 pub fn write_json_destination<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value)?;
+    bytes.push(b'\n');
+    ensure_output_size(&bytes)?;
     if path == Path::new("-") {
         let stdout = io::stdout();
         let mut output = stdout.lock();
-        serde_json::to_writer_pretty(&mut output, value)?;
-        writeln!(output)?;
+        output.write_all(&bytes)?;
         output.flush()?;
         Ok(())
     } else {
-        let mut bytes = serde_json::to_vec_pretty(value)?;
-        bytes.push(b'\n');
         write_bytes_destination(path, &bytes)
     }
 }
 
 pub fn write_text_destination(path: &Path, value: &str) -> Result<()> {
+    let bytes = format!("{value}\n");
+    ensure_output_size(bytes.as_bytes())?;
     if path == Path::new("-") {
-        println!("{value}");
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        output.write_all(bytes.as_bytes())?;
+        output.flush()?;
         Ok(())
     } else {
-        write_bytes_destination(path, format!("{value}\n").as_bytes())
+        write_bytes_destination(path, bytes.as_bytes())
     }
 }
 
@@ -265,33 +210,6 @@ pub fn ensure_destination_available(path: &Path) -> Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("inspect output path {}", path.display())),
     }
-}
-
-fn validate_kdf(kdf: &KdfParameters) -> Result<()> {
-    ensure!(
-        (8..=262_144).contains(&kdf.memory_kib),
-        "wallet KDF memory cost is outside supported limits"
-    );
-    ensure!(
-        (1..=10).contains(&kdf.iterations),
-        "wallet KDF iteration cost is outside supported limits"
-    );
-    ensure!(
-        (1..=16).contains(&kdf.parallelism),
-        "wallet KDF parallelism is outside supported limits"
-    );
-    Ok(())
-}
-
-fn derive_key(password: &str, kdf: &KdfParameters, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
-    let params = Params::new(kdf.memory_kib, kdf.iterations, kdf.parallelism, Some(32))
-        .map_err(|error| anyhow::anyhow!("invalid wallet KDF parameters: {error}"))?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = Zeroizing::new([0; 32]);
-    argon2
-        .hash_password_into(password.as_bytes(), salt, key.as_mut())
-        .map_err(|error| anyhow::anyhow!("failed to derive wallet encryption key: {error}"))?;
-    Ok(key)
 }
 
 fn open_lock(directory: &Path) -> Result<File> {
@@ -349,25 +267,26 @@ fn read_json_path<T: DeserializeOwned>(path: &Path) -> Result<T> {
 }
 
 fn read_limited(reader: impl Read) -> Result<Vec<u8>> {
+    read_limited_with_limit(reader, MAX_FILE_SIZE, "input exceeds 16 MiB limit")
+}
+
+fn read_state_limited(reader: impl Read) -> Result<Vec<u8>> {
+    read_limited_with_limit(
+        reader,
+        MAX_STATE_FILE_SIZE,
+        "encrypted wallet state exceeds 64 MiB limit",
+    )
+}
+
+fn read_limited_with_limit(reader: impl Read, limit: u64, message: &str) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    reader.take(MAX_FILE_SIZE + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_FILE_SIZE,
-        "input exceeds 16 MiB limit"
-    );
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= limit, "{message}");
     Ok(bytes)
 }
 
-fn decode_hex(label: &str, value: &str) -> Result<Vec<u8>> {
-    hex::decode(value).with_context(|| format!("invalid {label}"))
-}
-
 fn state_aad(config: &Config) -> Result<Vec<u8>> {
-    let digest = Sha256::digest(serde_json::to_vec(config)?);
-    let mut aad = Vec::with_capacity(STATE_AAD.len() + digest.len());
-    aad.extend_from_slice(STATE_AAD);
-    aad.extend_from_slice(&digest);
-    Ok(aad)
+    wallet_state_aad(config)
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -377,6 +296,16 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    ensure_output_size(bytes)?;
+    write_bytes_atomic_inner(path, bytes)
+}
+
+fn write_state_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    ensure_state_size(bytes)?;
+    write_bytes_atomic_inner(path, bytes)
+}
+
+fn write_bytes_atomic_inner(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -415,6 +344,7 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn write_bytes_destination(path: &Path, bytes: &[u8]) -> Result<()> {
+    ensure_output_size(bytes)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -470,6 +400,22 @@ fn write_bytes_destination(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
+fn ensure_output_size(bytes: &[u8]) -> Result<()> {
+    ensure!(
+        bytes.len() as u64 <= MAX_FILE_SIZE,
+        "output exceeds 16 MiB limit"
+    );
+    Ok(())
+}
+
+fn ensure_state_size(bytes: &[u8]) -> Result<()> {
+    ensure!(
+        bytes.len() as u64 <= MAX_STATE_FILE_SIZE,
+        "encrypted wallet state exceeds 64 MiB limit"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 fn set_private_mode(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -491,12 +437,11 @@ fn set_private_directory_mode(_: &mut fs::DirBuilder) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ChainConfig, EnclaveConfig};
+    use crate::model::{ChainConfig, EnclaveConfig, FILE_FORMAT_VERSION};
     use tinylayer_client::NetworkId;
 
     #[test]
     fn encrypted_state_round_trips_and_rejects_wrong_password() {
-        assert_eq!(STATE_AAD, b"tinylayer-wallet-state-v4");
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("alice");
         let config = Config {
@@ -559,5 +504,45 @@ mod tests {
         fs::write(&output, &expected).unwrap();
         write_json_destination(&output, &value).unwrap();
         assert_eq!(fs::read(&output).unwrap(), expected);
+    }
+
+    #[test]
+    fn oversized_writes_leave_existing_files_unchanged() {
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("state.enc");
+        fs::write(&output, b"original\n").unwrap();
+        let oversized = vec![0; MAX_FILE_SIZE as usize + 1];
+
+        assert_eq!(
+            write_bytes_atomic(&output, &oversized)
+                .unwrap_err()
+                .to_string(),
+            "output exceeds 16 MiB limit"
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"original\n");
+        assert!(write_bytes_destination(&output, &oversized).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"original\n");
+    }
+
+    #[test]
+    fn maximum_transfer_artifact_has_a_persistable_sender_state() {
+        let envelope = serde_json::json!({
+            "format_version": 1,
+            "request_id": "00".repeat(32),
+            "ephemeral_public_key": format!("02{}", "00".repeat(32)),
+            "nonce": "00".repeat(24),
+            "ciphertext": "00".repeat(MAX_TRANSFER_CIPHERTEXT_SIZE),
+        });
+        let mut artifact = serde_json::to_vec_pretty(&envelope).unwrap();
+        artifact.push(b'\n');
+        assert!(artifact.len() as u64 <= MAX_FILE_SIZE);
+
+        let final_sender = serde_json::json!({
+            "outgoing": envelope,
+            // Actual retained sender metadata, one recovery, and bounded funding are smaller.
+            "maximum_other_state": "x".repeat(2 * 1024 * 1024),
+        });
+        let sealed = seal_encrypted_json(&final_sender, "password", b"test").unwrap();
+        assert!(sealed.len() as u64 <= MAX_STATE_FILE_SIZE);
     }
 }

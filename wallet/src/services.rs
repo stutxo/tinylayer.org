@@ -1,19 +1,32 @@
-use std::{fs, net::IpAddr, path::Path, time::Duration};
+use std::{collections::HashSet, fs, net::IpAddr, path::Path, time::Duration};
 
 use anyhow::{Context as _, Result, bail, ensure};
-use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, consensus::deserialize};
+use bitcoin::{
+    Address, Amount, BlockHash, OutPoint, Transaction, TxOut,
+    blockdata::constants::genesis_block,
+    consensus::{deserialize, serialize},
+};
 use bitcoincore_rpc::{Auth, Client as BitcoinClient, RpcApi as _};
 use enclavia::Pcrs;
 use serde::Deserialize;
 use serde_json::json;
 use tinylayer_client::{
     CoinKeys, CoinMetadata, CoinStatus, NetworkId, RegisterRequest, RemoteEnclave, SignRequest,
-    SignResponse, SignedRecovery, funding_address, funding_script, validate_reaction_window,
-    verify_funding_utxo, verify_recovery, verify_status,
+    SignResponse, funding_address, funding_script, verify_funding_utxo,
 };
 use tinylayer_enclave::{Request, Response};
+use tinylayer_wallet_core::{
+    ObservedFunding, SourceUtxo, validate_finalized_funding, validate_funding_inputs,
+};
+pub use tinylayer_wallet_core::{require_reaction_margin, verify_public_history};
 
 use crate::model::{ChainConfig, EnclaveConfig};
+
+const MUTINYNET_CHECKPOINT_HEIGHT: u32 = 1;
+const MUTINYNET_CHECKPOINT_HASH: &str =
+    "000002855893a0a9b24eaffc5efc770558a326fee4fc10c9da22fc19cd2954f9";
+const MAX_HTTP_RESPONSE_SIZE: usize = 16 * 1024 * 1024;
+const MAX_SOURCE_UTXO_CANDIDATES: usize = 256;
 
 pub enum EnclaveConnection {
     Attested(RemoteEnclave),
@@ -129,7 +142,7 @@ impl EnclaveConnection {
             .await
             .context("call plaintext test enclave")?;
         let status = response.status();
-        let bytes = response.bytes().await?;
+        let bytes = response_bytes_limited(response).await?;
         if !status.is_success() {
             bail!(
                 "enclave returned HTTP {}: {}",
@@ -153,6 +166,26 @@ pub struct FundingObservation {
     pub confirmations: u32,
 }
 
+pub struct TransactionObservation {
+    pub transaction: Transaction,
+    pub tip_height: u32,
+    pub confirmations: u32,
+    pub raw_bytes_observed: bool,
+}
+
+pub struct OutspendObservation {
+    pub spent: bool,
+    pub spending_txid: Option<bitcoin::Txid>,
+    pub spending_confirmed: bool,
+}
+
+pub struct DetailedFundingObservation {
+    pub funding: ObservedFunding,
+    pub tip_height: u32,
+    pub spending_txid: Option<bitcoin::Txid>,
+    pub spending_confirmed: bool,
+}
+
 impl Chain {
     pub async fn connect(config: &ChainConfig, network: NetworkId) -> Result<Self> {
         ensure!(
@@ -160,7 +193,11 @@ impl Chain {
             "mainnet is not supported by this wallet"
         );
         match config {
-            ChainConfig::Explorer { url } => Ok(Self::Explorer(Explorer::connect(url)?)),
+            ChainConfig::Explorer { url } => {
+                let explorer = Explorer::connect(url, network)?;
+                explorer.verify_network().await?;
+                Ok(Self::Explorer(explorer))
+            }
             ChainConfig::CoreRpc {
                 rpc_url,
                 cookie_file,
@@ -199,6 +236,71 @@ impl Chain {
         match self {
             Self::Explorer(explorer) => explorer.tip_height().await,
             Self::Core(core) => core.tip_height(),
+        }
+    }
+
+    pub async fn confirmed_source_utxos(&self, address: &Address) -> Result<Vec<SourceUtxo>> {
+        match self {
+            Self::Explorer(explorer) => explorer.confirmed_source_utxos(address).await,
+            Self::Core(_) => bail!("local deposit funding requires an explorer backend"),
+        }
+    }
+
+    pub async fn transaction(
+        &self,
+        txid: &bitcoin::Txid,
+    ) -> Result<Option<TransactionObservation>> {
+        match self {
+            Self::Explorer(explorer) => explorer.transaction_observation(txid).await,
+            Self::Core(core) => core.transaction_observation(txid),
+        }
+    }
+
+    /// Reconciles a transaction durably authorized before submission. Core may
+    /// prove only its txid-committed data through a confirmed UTXO when raw
+    /// witness bytes are unavailable; the returned observation marks that case.
+    pub async fn observe_authorized_transaction(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<Option<TransactionObservation>> {
+        match self {
+            Self::Explorer(explorer) => {
+                let observed = explorer
+                    .transaction_observation(&transaction.compute_txid())
+                    .await?;
+                if let Some(observed) = &observed {
+                    ensure!(
+                        observed.transaction == *transaction,
+                        "explorer transaction bytes do not match the authorized transaction"
+                    );
+                }
+                Ok(observed)
+            }
+            Self::Core(core) => core.observe_authorized_transaction(transaction),
+        }
+    }
+
+    pub async fn outspend(&self, outpoint: OutPoint) -> Result<OutspendObservation> {
+        match self {
+            Self::Explorer(explorer) => explorer.outspend(outpoint).await,
+            Self::Core(core) => core.outspend(outpoint),
+        }
+    }
+
+    pub async fn observe_funding(
+        &self,
+        metadata: &CoinMetadata,
+    ) -> Result<DetailedFundingObservation> {
+        match self {
+            Self::Explorer(explorer) => explorer.observe_funding(metadata).await,
+            Self::Core(core) => core.observe_funding(metadata),
+        }
+    }
+
+    pub async fn broadcast_exact(&self, transaction: &Transaction) -> Result<bitcoin::Txid> {
+        match self {
+            Self::Explorer(explorer) => explorer.broadcast_exact(transaction).await,
+            Self::Core(core) => core.broadcast_exact(transaction),
         }
     }
 
@@ -266,13 +368,13 @@ pub fn default_explorer_url(network: NetworkId) -> Option<&'static str> {
 pub struct Explorer {
     client: reqwest::Client,
     base_url: String,
+    network: NetworkId,
 }
 
 #[derive(Deserialize)]
 struct ExplorerTx {
+    txid: bitcoin::Txid,
     status: ExplorerTxStatus,
-    vin: Vec<ExplorerVin>,
-    vout: Vec<ExplorerVout>,
 }
 
 #[derive(Deserialize)]
@@ -283,20 +385,18 @@ struct ExplorerTxStatus {
 }
 
 #[derive(Deserialize)]
-struct ExplorerVin {
-    #[serde(default)]
-    is_coinbase: bool,
-}
-
-#[derive(Deserialize)]
-struct ExplorerVout {
+struct ExplorerAddressUtxo {
+    txid: bitcoin::Txid,
+    vout: u32,
     value: u64,
-    scriptpubkey: String,
+    status: ExplorerTxStatus,
 }
 
 #[derive(Deserialize)]
 struct ExplorerOutspend {
     spent: bool,
+    txid: Option<bitcoin::Txid>,
+    status: Option<ExplorerTxStatus>,
 }
 
 #[derive(Deserialize)]
@@ -311,7 +411,7 @@ struct PackageResponse {
 }
 
 impl Explorer {
-    pub fn connect(url: &str) -> Result<Self> {
+    pub fn connect(url: &str, network: NetworkId) -> Result<Self> {
         validate_explorer_url(url)?;
         Ok(Self {
             client: reqwest::Client::builder()
@@ -319,7 +419,31 @@ impl Explorer {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             base_url: url.trim_end_matches('/').into(),
+            network,
         })
+    }
+
+    pub async fn verify_network(&self) -> Result<()> {
+        let observed = self.block_hash_at_height(0).await?;
+        let expected = genesis_block(self.network.bitcoin_network()).block_hash();
+        ensure!(
+            observed == expected,
+            "explorer genesis {observed} does not match {}",
+            network_name(self.network)
+        );
+        if self.network == NetworkId::Mutinynet {
+            let observed = self
+                .block_hash_at_height(MUTINYNET_CHECKPOINT_HEIGHT)
+                .await?;
+            let expected: BlockHash = MUTINYNET_CHECKPOINT_HASH
+                .parse()
+                .context("invalid built-in Mutinynet checkpoint")?;
+            ensure!(
+                observed == expected,
+                "explorer is Signet but does not match the Mutinynet checkpoint"
+            );
+        }
+        Ok(())
     }
 
     pub async fn verify_funding(
@@ -327,59 +451,226 @@ impl Explorer {
         metadata: &CoinMetadata,
         minimum_confirmations: u32,
     ) -> Result<FundingObservation> {
-        let tip_height = self.tip_height().await?;
-        let transaction = self.transaction(&metadata.outpoint.txid).await?;
-        let vout = metadata.outpoint.vout as usize;
-        let outspends: Vec<ExplorerOutspend> = self
-            .get_json(&format!("/tx/{}/outspends", metadata.outpoint.txid))
-            .await?;
+        let observed = self.observe_funding(metadata).await?;
         ensure!(
-            !outspends.get(vout).is_none_or(|outspend| outspend.spent),
-            "funding output is spent or missing"
-        );
-        let output = transaction
-            .vout
-            .get(vout)
-            .context("funding output index is missing")?;
-        ensure!(
-            transaction.status.confirmed,
-            "funding transaction is not confirmed"
-        );
-        let block_height = transaction
-            .status
-            .block_height
-            .context("funding transaction has no confirmed block height")?;
-        let block_hash = transaction
-            .status
-            .block_hash
-            .context("funding transaction has no confirmed block hash")?;
-        let best_hash = self.block_hash_at_height(block_height).await?;
-        ensure!(
-            best_hash == block_hash,
-            "funding block is not in the current best chain"
-        );
-        let confirmations = tip_height
-            .checked_sub(block_height)
-            .and_then(|depth| depth.checked_add(1))
-            .context("funding block is above the chain tip")?;
-        ensure!(
-            confirmations >= minimum_confirmations,
-            "funding output has {confirmations} confirmations; {minimum_confirmations} required",
+            observed.funding.unspent,
+            "funding output is spent by {}",
+            observed
+                .spending_txid
+                .map_or_else(|| "an unknown transaction".into(), |txid| txid.to_string())
         );
         ensure!(
-            !transaction.vin.first().is_some_and(|vin| vin.is_coinbase) || confirmations >= 100,
-            "coinbase funding output is not mature"
+            observed.funding.confirmations >= minimum_confirmations,
+            "funding output has {} confirmations; {minimum_confirmations} required",
+            observed.funding.confirmations
         );
-        let output = TxOut {
-            value: Amount::from_sat(output.value),
-            script_pubkey: ScriptBuf::from_hex(&output.scriptpubkey)
-                .context("explorer returned an invalid funding script")?,
-        };
-        verify_funding_utxo(metadata, metadata.outpoint, &output)?;
         Ok(FundingObservation {
+            tip_height: observed.tip_height,
+            confirmations: observed.funding.confirmations,
+        })
+    }
+
+    pub async fn confirmed_source_utxos(&self, address: &Address) -> Result<Vec<SourceUtxo>> {
+        let mut listed: Vec<ExplorerAddressUtxo> =
+            self.get_json(&format!("/address/{address}/utxo")).await?;
+        listed.retain(|utxo| utxo.status.confirmed);
+        let mut outpoints = HashSet::with_capacity(listed.len());
+        ensure!(
+            listed
+                .iter()
+                .all(|utxo| outpoints.insert((utxo.txid, utxo.vout))),
+            "explorer returned a duplicate deposit output"
+        );
+        listed.sort_by(|left, right| {
+            right
+                .value
+                .cmp(&left.value)
+                .then_with(|| (left.txid, left.vout).cmp(&(right.txid, right.vout)))
+        });
+        listed.truncate(MAX_SOURCE_UTXO_CANDIDATES);
+        let mut sources = Vec::with_capacity(listed.len());
+        for listed in listed {
+            let observed = self
+                .transaction_observation(&listed.txid)
+                .await?
+                .context("explorer listed a missing deposit transaction")?;
+            ensure!(
+                observed.confirmations > 0,
+                "explorer listed an unconfirmed deposit as confirmed"
+            );
+            let outpoint = OutPoint::new(listed.txid, listed.vout);
+            let output = observed
+                .transaction
+                .output
+                .get(listed.vout as usize)
+                .context("deposit output index is missing")?
+                .clone();
+            ensure!(
+                output.value == Amount::from_sat(listed.value),
+                "explorer deposit amount does not match its raw transaction"
+            );
+            ensure!(
+                output.script_pubkey == address.script_pubkey(),
+                "explorer deposit does not pay the local deposit address"
+            );
+            ensure!(
+                !self.outspend(outpoint).await?.spent,
+                "explorer listed a spent deposit output"
+            );
+            sources.push(SourceUtxo {
+                outpoint,
+                output,
+                confirmations: observed.confirmations,
+                coinbase: observed.transaction.is_coinbase(),
+            });
+        }
+        sources.sort_by_key(|source| source.outpoint);
+        Ok(sources)
+    }
+
+    pub async fn transaction_observation(
+        &self,
+        txid: &bitcoin::Txid,
+    ) -> Result<Option<TransactionObservation>> {
+        let Some(summary): Option<ExplorerTx> =
+            self.get_json_optional(&format!("/tx/{txid}")).await?
+        else {
+            return Ok(None);
+        };
+        ensure!(
+            summary.txid == *txid,
+            "explorer transaction has the wrong txid"
+        );
+        let transaction = self
+            .raw_transaction_optional(txid)
+            .await?
+            .context("explorer transaction summary has no raw transaction")?;
+        let tip_height = self.tip_height().await?;
+        let confirmations = self
+            .status_confirmations(&summary.status, tip_height)
+            .await?;
+        Ok(Some(TransactionObservation {
+            transaction,
             tip_height,
             confirmations,
+            raw_bytes_observed: true,
+        }))
+    }
+
+    pub async fn outspend(&self, outpoint: OutPoint) -> Result<OutspendObservation> {
+        let outspend: ExplorerOutspend = self
+            .get_json(&format!("/tx/{}/outspend/{}", outpoint.txid, outpoint.vout))
+            .await?;
+        if !outspend.spent {
+            ensure!(
+                outspend.txid.is_none(),
+                "unspent explorer output unexpectedly names a spender"
+            );
+            return Ok(OutspendObservation {
+                spent: false,
+                spending_txid: None,
+                spending_confirmed: false,
+            });
+        }
+        let spending_txid = outspend
+            .txid
+            .context("spent explorer output has no spending txid")?;
+        let status = outspend
+            .status
+            .context("spent explorer output has no spending status")?;
+        let tip_height = self.tip_height().await?;
+        let confirmations = self.status_confirmations(&status, tip_height).await?;
+        Ok(OutspendObservation {
+            spent: true,
+            spending_txid: Some(spending_txid),
+            spending_confirmed: confirmations > 0,
         })
+    }
+
+    pub async fn observe_funding(
+        &self,
+        metadata: &CoinMetadata,
+    ) -> Result<DetailedFundingObservation> {
+        ensure!(
+            metadata.network == self.network,
+            "funding network does not match explorer"
+        );
+        let observed = self
+            .transaction_observation(&metadata.outpoint.txid)
+            .await?
+            .context("funding transaction is missing")?;
+        let output = observed
+            .transaction
+            .output
+            .get(metadata.outpoint.vout as usize)
+            .context("funding output index is missing")?;
+        verify_funding_utxo(metadata, metadata.outpoint, output)?;
+        ensure!(
+            !observed.transaction.is_coinbase() || observed.confirmations >= 100,
+            "coinbase funding output is not mature"
+        );
+        let outspend = self.outspend(metadata.outpoint).await?;
+        Ok(DetailedFundingObservation {
+            funding: ObservedFunding {
+                outpoint: metadata.outpoint,
+                output: output.clone(),
+                confirmations: observed.confirmations,
+                unspent: !outspend.spent,
+                coinbase: observed.transaction.is_coinbase(),
+            },
+            tip_height: observed.tip_height,
+            spending_txid: outspend.spending_txid,
+            spending_confirmed: outspend.spending_confirmed,
+        })
+    }
+
+    pub async fn broadcast_exact(&self, transaction: &Transaction) -> Result<bitcoin::Txid> {
+        validate_funding_inputs(transaction)?;
+        let expected = transaction.compute_txid();
+        if self.exact_transaction_is_observed(transaction).await? {
+            return Ok(expected);
+        }
+        let response = self
+            .client
+            .post(format!("{}/tx", self.base_url))
+            .header(reqwest::header::CONTENT_TYPE, "text/plain")
+            .body(hex::encode(serialize(transaction)))
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                if self.exact_transaction_is_observed(transaction).await? {
+                    return Ok(expected);
+                }
+                return Err(error).context("broadcast exact transaction");
+            }
+        };
+        let status = response.status();
+        let body = String::from_utf8(response_bytes_limited(response).await?)
+            .context("explorer returned a non-UTF-8 broadcast response")?;
+        if !status.is_success() {
+            if self.exact_transaction_is_observed(transaction).await? {
+                return Ok(expected);
+            }
+            bail!(
+                "explorer rejected transaction with HTTP {}: {body}",
+                status.as_u16()
+            );
+        }
+        let returned: bitcoin::Txid = body
+            .trim()
+            .parse()
+            .context("explorer returned an invalid broadcast txid")?;
+        ensure!(
+            returned == expected,
+            "explorer returned the wrong broadcast txid"
+        );
+        ensure!(
+            self.exact_transaction_is_observed(transaction).await?,
+            "explorer accepted the transaction but did not expose its exact bytes"
+        );
+        Ok(expected)
     }
 
     pub async fn tip_height(&self) -> Result<u32> {
@@ -392,19 +683,27 @@ impl Explorer {
 
     pub async fn recommended_fee_rate(&self) -> Result<u64> {
         let fees: ExplorerFees = self.get_json("/v1/fees/recommended").await?;
-        Ok(fees.fastest_fee.ceil().max(1.0) as u64)
+        ensure!(
+            fees.fastest_fee.is_finite()
+                && fees.fastest_fee > 0.0
+                && fees.fastest_fee <= 1_000_000.0,
+            "explorer returned an invalid fee recommendation"
+        );
+        Ok(fees.fastest_fee.ceil() as u64)
     }
 
     pub async fn submit_package(&self, parent_hex: &str, child_hex: &str) -> Result<()> {
-        let response = self
-            .client
-            .post(format!("{}/v1/txs/package", self.base_url))
-            .json(&json!([parent_hex, child_hex]))
-            .send()
-            .await
-            .context("submit recovery package")?;
+        let mut response = self
+            .post_package("/txs/package", parent_hex, child_hex)
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            response = self
+                .post_package("/v1/txs/package", parent_hex, child_hex)
+                .await?;
+        }
         let status = response.status();
-        let body = response.text().await?;
+        let body = String::from_utf8(response_bytes_limited(response).await?)
+            .context("explorer returned a non-UTF-8 package response")?;
         ensure!(
             status.is_success(),
             "explorer rejected the recovery package with HTTP {}: {}",
@@ -420,10 +719,75 @@ impl Explorer {
         Ok(())
     }
 
-    async fn transaction(&self, txid: &bitcoin::Txid) -> Result<ExplorerTx> {
-        self.get_json(&format!("/tx/{txid}"))
+    async fn post_package(
+        &self,
+        path: &str,
+        parent_hex: &str,
+        child_hex: &str,
+    ) -> Result<reqwest::Response> {
+        self.client
+            .post(format!("{}{path}", self.base_url))
+            .json(&json!([parent_hex, child_hex]))
+            .send()
             .await
-            .context("funding transaction is missing")
+            .with_context(|| format!("submit recovery package to {path}"))
+    }
+
+    async fn exact_transaction_is_observed(&self, expected: &Transaction) -> Result<bool> {
+        let Some(observed) = self
+            .transaction_observation(&expected.compute_txid())
+            .await?
+        else {
+            return Ok(false);
+        };
+        ensure!(
+            observed.transaction == *expected,
+            "explorer transaction bytes do not match the saved transaction"
+        );
+        Ok(true)
+    }
+
+    async fn raw_transaction_optional(&self, txid: &bitcoin::Txid) -> Result<Option<Transaction>> {
+        let Some(body) = self.get_text_optional(&format!("/tx/{txid}/hex")).await? else {
+            return Ok(None);
+        };
+        let bytes =
+            hex::decode(body.trim()).context("explorer returned invalid transaction hex")?;
+        let transaction: Transaction =
+            deserialize(&bytes).context("explorer returned an invalid raw transaction")?;
+        ensure!(
+            transaction.compute_txid() == *txid,
+            "explorer raw transaction has the wrong txid"
+        );
+        Ok(Some(transaction))
+    }
+
+    async fn status_confirmations(
+        &self,
+        status: &ExplorerTxStatus,
+        tip_height: u32,
+    ) -> Result<u32> {
+        if !status.confirmed {
+            ensure!(
+                status.block_height.is_none() && status.block_hash.is_none(),
+                "unconfirmed explorer transaction has block metadata"
+            );
+            return Ok(0);
+        }
+        let block_height = status
+            .block_height
+            .context("confirmed explorer transaction has no block height")?;
+        let block_hash = status
+            .block_hash
+            .context("confirmed explorer transaction has no block hash")?;
+        ensure!(
+            self.block_hash_at_height(block_height).await? == block_hash,
+            "transaction block is not in the current best chain"
+        );
+        tip_height
+            .checked_sub(block_height)
+            .and_then(|depth| depth.checked_add(1))
+            .context("transaction block is above the chain tip")
     }
 
     async fn block_hash_at_height(&self, height: u32) -> Result<BlockHash> {
@@ -435,6 +799,12 @@ impl Explorer {
     }
 
     async fn get_text(&self, path: &str) -> Result<String> {
+        self.get_text_optional(path)
+            .await?
+            .with_context(|| format!("explorer returned HTTP 404 for {path}"))
+    }
+
+    async fn get_text_optional(&self, path: &str) -> Result<Option<String>> {
         let response = self
             .client
             .get(format!("{}{path}", self.base_url))
@@ -442,18 +812,35 @@ impl Explorer {
             .await
             .with_context(|| format!("query explorer {path}"))?;
         let status = response.status();
-        let body = response.text().await?;
+        let body = String::from_utf8(response_bytes_limited(response).await?)
+            .with_context(|| format!("explorer returned non-UTF-8 data for {path}"))?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         ensure!(
             status.is_success(),
-            "explorer returned HTTP {} for {path}",
-            status.as_u16()
+            "explorer returned HTTP {} for {path}: {body}",
+            status.as_u16(),
         );
-        Ok(body)
+        Ok(Some(body))
     }
 
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T> {
         let body = self.get_text(path).await?;
         serde_json::from_str(&body).with_context(|| format!("invalid explorer response at {path}"))
+    }
+
+    async fn get_json_optional<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+    ) -> Result<Option<T>> {
+        self.get_text_optional(path)
+            .await?
+            .map(|body| {
+                serde_json::from_str(&body)
+                    .with_context(|| format!("invalid explorer response at {path}"))
+            })
+            .transpose()
     }
 }
 
@@ -499,6 +886,14 @@ struct WalletTransaction {
     hex: String,
 }
 
+#[derive(Deserialize)]
+struct CoreSpendingPrevout {
+    txid: bitcoin::Txid,
+    vout: u32,
+    #[serde(rename = "spendingtxid")]
+    spending_txid: Option<bitcoin::Txid>,
+}
+
 impl Core {
     pub fn connect(
         rpc_url: &str,
@@ -516,6 +911,272 @@ impl Core {
             wallet_name: wallet_name.to_owned(),
             network,
         })
+    }
+
+    pub fn transaction_observation(
+        &self,
+        txid: &bitcoin::Txid,
+    ) -> Result<Option<TransactionObservation>> {
+        match self.client.get_raw_transaction_info(txid, None) {
+            Ok(info) => {
+                ensure!(info.txid == *txid, "Bitcoin Core returned the wrong txid");
+                ensure!(
+                    info.in_active_chain != Some(false),
+                    "Bitcoin Core transaction is not in the active chain"
+                );
+                let transaction = info
+                    .transaction()
+                    .context("Bitcoin Core returned an invalid raw transaction")?;
+                let tip_height = self.tip_height()?;
+                return Ok(Some(TransactionObservation {
+                    transaction,
+                    tip_height,
+                    confirmations: info.confirmations.unwrap_or_default(),
+                    raw_bytes_observed: true,
+                }));
+            }
+            Err(error) if is_rpc_not_found(&error) => {}
+            Err(error) => return Err(error).context("query Bitcoin Core raw transaction"),
+        }
+
+        let result: WalletTransaction = match self.client.call("gettransaction", &[json!(txid)]) {
+            Ok(result) => result,
+            Err(error) if is_rpc_not_found(&error) => return Ok(None),
+            Err(error) => return Err(error).context("query Bitcoin Core wallet transaction"),
+        };
+        ensure!(
+            result.txid == *txid,
+            "Bitcoin Core returned a mismatched wallet transaction"
+        );
+        ensure!(
+            result.confirmations >= 0 && result.walletconflicts.is_empty(),
+            "Bitcoin Core transaction is conflicted"
+        );
+        if result.confirmations == 0 {
+            match self.client.get_mempool_entry(txid) {
+                Ok(_) => {}
+                Err(error) if is_rpc_not_found(&error) => return Ok(None),
+                Err(error) => return Err(error).context("query Bitcoin Core mempool entry"),
+            }
+        }
+        let transaction: Transaction = deserialize(
+            &hex::decode(&result.hex).context("Bitcoin Core returned invalid transaction hex")?,
+        )
+        .context("Bitcoin Core returned an invalid wallet transaction")?;
+        ensure!(
+            transaction.compute_txid() == *txid,
+            "Bitcoin Core wallet transaction has the wrong txid"
+        );
+        Ok(Some(TransactionObservation {
+            transaction,
+            tip_height: self.tip_height()?,
+            confirmations: u32::try_from(result.confirmations)
+                .context("Bitcoin Core returned negative confirmations")?,
+            raw_bytes_observed: true,
+        }))
+    }
+
+    pub fn observe_authorized_transaction(
+        &self,
+        transaction: &Transaction,
+    ) -> Result<Option<TransactionObservation>> {
+        let txid = transaction.compute_txid();
+        if let Some(observed) = self.transaction_observation(&txid)? {
+            ensure!(
+                observed.transaction == *transaction,
+                "Bitcoin Core transaction bytes do not match the authorized transaction"
+            );
+            return Ok(Some(observed));
+        }
+
+        let mut chain = self.chain_info()?;
+        for (vout, expected) in transaction.output.iter().enumerate() {
+            let Some(result) = self
+                .client
+                .get_tx_out(
+                    &txid,
+                    u32::try_from(vout).context("transaction output index exceeds u32")?,
+                    Some(true),
+                )
+                .context("query Bitcoin Core authorized transaction output")?
+            else {
+                continue;
+            };
+            ensure!(
+                result.confirmations > 0,
+                "Bitcoin Core hid an unconfirmed authorized transaction's raw bytes"
+            );
+            if result.bestblock != chain.best_block_hash {
+                chain = self.chain_info()?;
+            }
+            ensure!(
+                result.bestblock == chain.best_block_hash,
+                "Bitcoin Core authorized transaction observation is not from the current best block"
+            );
+            let output = TxOut {
+                value: result.value,
+                script_pubkey: result
+                    .script_pub_key
+                    .script()
+                    .context("Bitcoin Core returned an invalid transaction output script")?,
+            };
+            ensure!(
+                output == *expected,
+                "Bitcoin Core transaction output does not match the authorized transaction"
+            );
+            return Ok(Some(TransactionObservation {
+                transaction: transaction.clone(),
+                tip_height: u32::try_from(chain.blocks)
+                    .context("Bitcoin Core block height exceeds u32")?,
+                confirmations: result.confirmations,
+                raw_bytes_observed: false,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn outspend(&self, outpoint: OutPoint) -> Result<OutspendObservation> {
+        let results: Vec<CoreSpendingPrevout> = self
+            .client
+            .call(
+                "gettxspendingprevout",
+                &[json!([{"txid": outpoint.txid, "vout": outpoint.vout}])],
+            )
+            .context("query Bitcoin Core outspend")?;
+        let result = results
+            .first()
+            .context("Bitcoin Core returned no outspend result")?;
+        ensure!(
+            results.len() == 1 && result.txid == outpoint.txid && result.vout == outpoint.vout,
+            "Bitcoin Core returned a mismatched outspend result"
+        );
+        let spending_confirmed = match result.spending_txid {
+            Some(txid) => self
+                .transaction_observation(&txid)?
+                .is_some_and(|observation| observation.confirmations > 0),
+            None => false,
+        };
+        let spent = if result.spending_txid.is_some() {
+            true
+        } else {
+            self.client
+                .get_tx_out(&outpoint.txid, outpoint.vout, Some(true))
+                .context("query Bitcoin Core output")?
+                .is_none()
+        };
+        Ok(OutspendObservation {
+            spent,
+            spending_txid: result.spending_txid,
+            spending_confirmed: spending_confirmed || (spent && result.spending_txid.is_none()),
+        })
+    }
+
+    pub fn observe_funding(&self, metadata: &CoinMetadata) -> Result<DetailedFundingObservation> {
+        ensure!(
+            metadata.network == self.network,
+            "funding network does not match Bitcoin Core"
+        );
+        if let Some(result) = self
+            .client
+            .get_tx_out(&metadata.outpoint.txid, metadata.outpoint.vout, Some(true))
+            .context("query Bitcoin Core funding UTXO")?
+        {
+            let mut chain = self.chain_info()?;
+            if result.bestblock != chain.best_block_hash {
+                chain = self.chain_info()?;
+            }
+            ensure!(
+                result.bestblock == chain.best_block_hash,
+                "Bitcoin Core funding observation is not from the current best block"
+            );
+            let output = TxOut {
+                value: result.value,
+                script_pubkey: result
+                    .script_pub_key
+                    .script()
+                    .context("Bitcoin Core returned an invalid funding script")?,
+            };
+            verify_funding_utxo(metadata, metadata.outpoint, &output)?;
+            ensure!(
+                !result.coinbase || result.confirmations >= 100,
+                "coinbase funding output is not mature"
+            );
+            return Ok(DetailedFundingObservation {
+                funding: ObservedFunding {
+                    outpoint: metadata.outpoint,
+                    output,
+                    confirmations: result.confirmations,
+                    unspent: true,
+                    coinbase: result.coinbase,
+                },
+                tip_height: u32::try_from(chain.blocks)
+                    .context("Bitcoin Core block height exceeds u32")?,
+                spending_txid: None,
+                spending_confirmed: false,
+            });
+        }
+
+        let observed = self
+            .transaction_observation(&metadata.outpoint.txid)?
+            .context("spent funding transaction is unavailable from Bitcoin Core")?;
+        let output = observed
+            .transaction
+            .output
+            .get(metadata.outpoint.vout as usize)
+            .context("funding output index is missing")?
+            .clone();
+        verify_funding_utxo(metadata, metadata.outpoint, &output)?;
+        let coinbase = observed.transaction.is_coinbase();
+        ensure!(
+            !coinbase || observed.confirmations >= 100,
+            "coinbase funding output is not mature"
+        );
+        let outspend = self.outspend(metadata.outpoint)?;
+        Ok(DetailedFundingObservation {
+            funding: ObservedFunding {
+                outpoint: metadata.outpoint,
+                output,
+                confirmations: observed.confirmations,
+                unspent: false,
+                coinbase,
+            },
+            tip_height: observed.tip_height,
+            spending_txid: outspend.spending_txid,
+            spending_confirmed: outspend.spending_confirmed,
+        })
+    }
+
+    pub fn broadcast_exact(&self, transaction: &Transaction) -> Result<bitcoin::Txid> {
+        validate_funding_inputs(transaction)?;
+        let expected = transaction.compute_txid();
+        if let Some(observed) = self.transaction_observation(&expected)? {
+            ensure!(
+                observed.transaction == *transaction,
+                "Bitcoin Core transaction bytes do not match the saved transaction"
+            );
+            return Ok(expected);
+        }
+        match self.client.send_raw_transaction(transaction) {
+            Ok(txid) => ensure!(txid == expected, "Bitcoin Core returned the wrong txid"),
+            Err(error) => {
+                if let Some(observed) = self.transaction_observation(&expected)? {
+                    ensure!(
+                        observed.transaction == *transaction,
+                        "Bitcoin Core transaction bytes do not match the saved transaction"
+                    );
+                    return Ok(expected);
+                }
+                return Err(error).context("broadcast exact transaction");
+            }
+        }
+        let observed = self
+            .transaction_observation(&expected)?
+            .context("Bitcoin Core accepted the transaction but it is not observable")?;
+        ensure!(
+            observed.transaction == *transaction,
+            "Bitcoin Core transaction bytes do not match the saved transaction"
+        );
+        Ok(expected)
     }
 
     pub fn prepare_funding(
@@ -842,58 +1503,34 @@ impl Core {
     }
 }
 
+async fn response_bytes_limited(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    if let Some(length) = response.content_length() {
+        ensure!(
+            length <= MAX_HTTP_RESPONSE_SIZE as u64,
+            "HTTP response exceeds 16 MiB limit"
+        );
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        let length = bytes
+            .len()
+            .checked_add(chunk.len())
+            .context("HTTP response length overflow")?;
+        ensure!(
+            length <= MAX_HTTP_RESPONSE_SIZE,
+            "HTTP response exceeds 16 MiB limit"
+        );
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 fn is_rpc_not_found(error: &bitcoincore_rpc::Error) -> bool {
     matches!(
         error,
         bitcoincore_rpc::Error::JsonRpc(bitcoincore_rpc::jsonrpc::Error::Rpc(error))
             if error.code == -5
     )
-}
-
-fn validate_funding_inputs(transaction: &Transaction) -> Result<()> {
-    ensure!(
-        !transaction.input.is_empty(),
-        "funding transaction has no inputs"
-    );
-    for input in &transaction.input {
-        ensure!(
-            !input.previous_output.is_null(),
-            "funding transaction cannot spend a coinbase input"
-        );
-        ensure!(
-            input.script_sig.is_empty() && !input.witness.is_empty(),
-            "funding transaction must use only native SegWit or Taproot inputs"
-        );
-        ensure!(
-            !input.sequence.is_rbf(),
-            "funding transaction inputs must not signal replace-by-fee"
-        );
-    }
-    Ok(())
-}
-
-fn validate_finalized_funding(metadata: &CoinMetadata, transaction: &Transaction) -> Result<()> {
-    validate_funding_inputs(transaction)?;
-    ensure!(
-        transaction.compute_txid() == metadata.outpoint.txid,
-        "prepared funding transaction txid does not match coin metadata"
-    );
-    let expected_script = funding_script(&metadata.keys);
-    ensure!(
-        transaction
-            .output
-            .iter()
-            .filter(|output| output.script_pubkey == expected_script)
-            .count()
-            == 1,
-        "funding transaction must contain exactly one Tinylayer output"
-    );
-    let output = transaction
-        .output
-        .get(metadata.outpoint.vout as usize)
-        .context("prepared funding output index is missing")?;
-    verify_funding_utxo(metadata, metadata.outpoint, output)?;
-    Ok(())
 }
 
 pub fn validate_core_config(rpc_url: &str, cookie_file: &Path) -> Result<()> {
@@ -978,54 +1615,6 @@ pub fn validate_explorer_url(value: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn verify_public_history(
-    metadata: &CoinMetadata,
-    status: &CoinStatus,
-    history: &[SignedRecovery],
-    funding_confirmations: u32,
-    minimum_reaction_blocks: u32,
-) -> Result<()> {
-    verify_status(&metadata.keys, status)?;
-    ensure!(
-        status.signature_count == history.len() as u64,
-        "recovery history does not match enclave signature count"
-    );
-    ensure!(!history.is_empty(), "coin has no signed recovery");
-    for recovery in history {
-        verify_recovery(metadata, recovery)?;
-    }
-    for pair in history.windows(2) {
-        validate_reaction_window(
-            funding_confirmations,
-            pair[0].delay_blocks,
-            pair[1].delay_blocks,
-        )?;
-    }
-    require_reaction_margin(
-        funding_confirmations,
-        history
-            .last()
-            .expect("history checked non-empty")
-            .delay_blocks,
-        minimum_reaction_blocks,
-    )
-}
-
-pub fn require_reaction_margin(
-    funding_confirmations: u32,
-    delay_blocks: u32,
-    minimum_reaction_blocks: u32,
-) -> Result<()> {
-    let minimum = funding_confirmations
-        .checked_add(minimum_reaction_blocks)
-        .context("reaction margin overflow")?;
-    ensure!(
-        delay_blocks > minimum,
-        "latest recovery delay {delay_blocks} must be greater than funding confirmations {funding_confirmations} plus reaction margin {minimum_reaction_blocks}"
-    );
-    Ok(())
-}
-
 pub fn network_name(network: NetworkId) -> &'static str {
     match network {
         NetworkId::Mutinynet => "mutinynet",
@@ -1065,8 +1654,9 @@ fn validate_plaintext_url(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, extract::Path as AxumPath, routing::get};
     use bitcoin::{
-        Sequence, TxIn, Witness, absolute, hashes::Hash as _, secp256k1::SecretKey,
+        ScriptBuf, Sequence, TxIn, Witness, absolute, hashes::Hash as _, secp256k1::SecretKey,
         transaction::Version,
     };
 
@@ -1081,6 +1671,57 @@ mod tests {
             .err()
             .expect("mainnet must be rejected before connecting");
         assert_eq!(error.to_string(), "mainnet is not supported by this wallet");
+    }
+
+    #[tokio::test]
+    async fn mutinynet_rejects_another_chain_with_the_same_signet_genesis() {
+        async fn block_hash(AxumPath(height): AxumPath<u32>) -> String {
+            if height == 0 {
+                genesis_block(bitcoin::Network::Signet)
+                    .block_hash()
+                    .to_string()
+            } else {
+                "00000086d6b2636cb2a392d45edc4ec544a10024d30141c9adf4bfd9de533b53".into()
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/block-height/{height}", get(block_hash)),
+            )
+            .await
+            .unwrap();
+        });
+        let explorer =
+            Explorer::connect(&format!("http://{address}"), NetworkId::Mutinynet).unwrap();
+        let error = explorer.verify_network().await.unwrap_err();
+        server.abort();
+        assert_eq!(
+            error.to_string(),
+            "explorer is Signet but does not match the Mutinynet checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn explorer_response_body_is_bounded() {
+        async fn oversized() -> Vec<u8> {
+            vec![b'a'; MAX_HTTP_RESPONSE_SIZE + 1]
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/large", get(oversized)))
+                .await
+                .unwrap();
+        });
+        let explorer = Explorer::connect(&format!("http://{address}"), NetworkId::Regtest).unwrap();
+        let error = explorer.get_text("/large").await.unwrap_err();
+        server.abort();
+        assert_eq!(error.to_string(), "HTTP response exceeds 16 MiB limit");
     }
 
     #[test]

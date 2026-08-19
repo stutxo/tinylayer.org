@@ -31,13 +31,16 @@ Trust assumptions:
 
 ## Project guide
 
-Tinylayer is a Rust workspace with three components:
+Tinylayer keeps protocol logic in small Rust crates and ships a native wallet:
 
 | Component | Purpose | Documentation |
 | --- | --- | --- |
 | `enclave` | Trusted in-memory signer and Enclavia workload | [Architecture, API, deployment, and operations](enclave/) |
 | `client` | Untrusted attested transport and Bitcoin transaction validation library | [Client integration guide](client/) |
+| `wallet-core` | I/O-independent native state machine, transfer crypto, encrypted codec, and validation | [Shared wallet core](wallet-core/) |
 | `wallet` | Native CLI, durable journal, chain backends, and transfer files | [Wallet and Regtest guide](wallet/) |
+
+The exact protocol is summarized in [`PROTOCOL.md`](PROTOCOL.md).
 
 The fastest complete local exercise is the wallet's
 [automated Regtest test](wallet/#automated-regtest-test). To build and

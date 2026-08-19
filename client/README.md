@@ -27,8 +27,15 @@ does not know:
   irreversible network calls.
 
 The crate does not provide a chain backend, wallet database, transfer-file
-encryption, command-line interface, or plaintext remote transport. Those live
-in `tinylayer-wallet`.
+encryption, or command-line interface. Shared wallet state and crypto live in
+`tinylayer-wallet-core`; native adapters live in `tinylayer-wallet`.
+
+Build without the Enclavia transport when only pure Bitcoin and protocol rules
+are needed:
+
+```toml
+tinylayer-client = { path = "../client", default-features = false }
+```
 
 ## Add the library
 
@@ -268,12 +275,11 @@ A safe integration must durably persist:
 The funding transaction must not be broadcast until that final state
 transition has been durably persisted and independently verified.
 
-The relative-delay `PreparedRecovery` and `SignedRecovery` JSON schemas are a
-breaking change: old `locktime` records are rejected and cannot be converted
-after signing because sequence and locktime are part of the sighash. This crate
-does not add a format field to those low-level values; external integrators
-must version the journal that contains them. The reference wallet uses file
-format version 4 and has no version 3 migration.
+The relative-delay `PreparedRecovery` and `SignedRecovery` JSON schemas are the
+version-1 definitions. Sequence and locktime are part of the sighash, so these
+low-level values cannot be reinterpreted after signing. This crate does not add
+a format field to them; external integrators must version the journal that
+contains them. The reference wallet uses file format version 1.
 
 Never resolve an uncertain network result by creating another request. Query
 status first. If count and authorization still equal the prepared request's old
